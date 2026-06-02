@@ -246,8 +246,8 @@ def main() -> None:
         raise ValueError(f"Generator {n_g_total/1e6:.2f}M exceeds 40M limit!")
 
     # --- Optimizers (only refiner params for G) ---
-    lr_g = float(train_cfg.get("lr_g", train_cfg["lr"]))
-    lr_d = float(train_cfg.get("lr_d", train_cfg["lr"]))
+    lr_g = float(train_cfg.get("lr_g", train_cfg.get("lr", 1e-4)))
+    lr_d = float(train_cfg.get("lr_d", train_cfg.get("lr", 1e-4)))
     optG = torch.optim.Adam(
         G.refiner.parameters(), lr=lr_g,
         betas=(train_cfg["beta1"], train_cfg["beta2"]), eps=1e-8,
