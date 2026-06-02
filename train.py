@@ -328,8 +328,15 @@ def main() -> None:
     wandb_mode = wandb_cfg.get("mode", "disabled") if _HAS_WANDB else "disabled"
     run        = None
     if wandb_mode != "disabled":
-        if key := os.environ.get(wandb_cfg.get("api_key_env", "WANDB_API_KEY"), ""):
-            wandb.login(key=key, relogin=False)
+        if wandb_cfg.get("login", True) and wandb_mode == "online":
+            api_key = os.environ.get(wandb_cfg.get("api_key_env", "WANDB_API_KEY"), "")
+            if api_key:
+                wandb.login(key=api_key, relogin=False)
+                print(f"wandb: logged in via env var")
+            else:
+                # Colab에서 키 입력 프롬프트가 뜹니다
+                print("wandb: no API key env var — prompting for login")
+                wandb.login()
         init_kw: dict = {
             "project": wandb_cfg.get("project", "ffhqgen-student"),
             "name":    wandb_cfg.get("name"),

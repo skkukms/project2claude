@@ -1,15 +1,15 @@
 # SR-Refiner GAN: frozen 256 backbone + adversarial SR refiner (256->1024)
 #
-# Usage:
+# Usage (Colab):
 #   python train.py \
 #     --config configs/sr_refiner.yaml \
-#     --backbone-ckpt ckpt/ffhq256_baseline.pt
+#     --backbone-ckpt /content/drive/MyDrive/project2/ckpt/ffhq256_baseline.pt
 #
 # Resume:
 #   python train.py \
 #     --config configs/sr_refiner.yaml \
-#     --backbone-ckpt ckpt/ffhq256_baseline.pt \
-#     --resume runs/sr_refiner/ckpt_000050000.pt
+#     --backbone-ckpt /content/drive/MyDrive/project2/ckpt/ffhq256_baseline.pt \
+#     --resume /content/drive/MyDrive/project2claude/runs/sr_refiner/ckpt_000050000.pt
 
 backbone:
   z_dim: 512
@@ -49,7 +49,7 @@ discriminator:
   attention_resolutions: [32]
 
 training:
-  train_zip: data/train_50k_1024.zip
+  train_zip: /content/drive/MyDrive/project2/train_50k_1024.zip
   resolution: 1024
   batch_size: 4           # 1024 is heavy; reduce to 2 if OOM on T4
   total_images: 300_000
@@ -84,6 +84,9 @@ wandb:
   project: ffhqgen-student
   name: sr_refiner_1024
   mode: online
+  login: true                        # wandb.login() 자동 호출
+  api_key_env: WANDB_API_KEY         # 환경변수 있으면 자동, 없으면 Colab 프롬프트
+  # entity: your_wandb_username      # 팀/개인 entity (필요하면 주석 해제)
 
 out:
-  run_dir: runs/sr_refiner
+  run_dir: /content/drive/MyDrive/project2claude/runs/sr_refiner
