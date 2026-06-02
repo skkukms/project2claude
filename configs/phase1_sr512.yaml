@@ -69,8 +69,8 @@ training:
   grad_clip_g: 10.0
   grad_clip_d: 20.0
 
-  r1_gamma: 10.0
-  r1_lazy_every: 32
+  r1_gamma: 1.0
+  r1_lazy_every: 16
 
   ema_half_life: 10_000
 
