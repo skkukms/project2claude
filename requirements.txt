@@ -1,0 +1,12 @@
+torch>=2.1
+torchvision>=0.16
+numpy>=1.24
+pillow>=10.0
+pyyaml>=6.0
+wandb>=0.16
+# ONNX export — `onnx` is required by torch's legacy exporter; `onnxruntime`
+# is optional and only needed to verify your exported model locally.
+onnx>=1.15
+onnxruntime>=1.16
+# For FID measurement, install separately when you set up your evaluation:
+#   pip install pytorch-fid scipy

@@ -1,0 +1,70 @@
+generator:
+  z_dim: 512                              # mandatory (assignment spec)
+  resolutions: [4, 8, 16, 32, 64, 128, 256]
+  channels:
+    4: 512
+    8: 512
+    16: 512
+    32: 512
+    64: 256
+    128: 128
+    256: 64
+  norm_type: gn
+  gn_groups: 32
+  attention_resolutions: [32]
+
+discriminator:
+  resolutions: [256, 128, 64, 32, 16, 8, 4]
+  channels:
+    256: 64
+    128: 128
+    64: 256
+    32: 512
+    16: 512
+    8: 512
+    4: 512
+  use_spectral_norm: true
+  minibatch_std_group: 4
+  attention_resolutions: [32]
+
+training:
+  # Replace this with the path to whatever zip you build for your run
+  # (256 / 512 / 1024). The zip should contain equal-resolution PNG or JPG.
+  train_zip: data/train_50k_256.zip
+  resolution: 256
+  batch_size: 64
+  total_images: 2_000_000
+  num_workers: 8
+  flip: true
+
+  precision: fp32                         # fp32 is recommended
+  augment: color,translation
+
+  lr_g: 0.001
+  lr_d: 0.001
+  beta1: 0.0
+  beta2: 0.9                              # 0.9, not 0.99
+  weight_decay: 0.0
+
+  grad_clip_g: 10.0
+  grad_clip_d: 100.0                      # D has SN → effectively no clip
+
+  r1_gamma: 10.0
+  r1_lazy_every: 16
+
+  ema_half_life: 10_000
+
+  ckpt_every: 100_000
+
+  log_every: 50
+  sample_n: 64
+  sample_seed: 12345
+  seed: 42
+
+wandb:
+  project: ffhqgen-student
+  name: my_run
+  mode: online                            # online | offline | disabled
+
+out:
+  run_dir: runs/my_run

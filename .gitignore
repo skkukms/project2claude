@@ -1,0 +1,13 @@
+# Data & checkpoints
+ckpt/
+runs/
+data/
+wandb/
+*.pt
+*.pth
+*.onnx
+*.zip
+__pycache__/
+*.pyc
+.DS_Store
+*.tmp

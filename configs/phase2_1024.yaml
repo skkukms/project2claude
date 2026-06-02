@@ -1,0 +1,98 @@
+# Phase 2: 1024 residual training
+#
+# Strategy:
+#   - Load best Phase-1 checkpoint via --init-from
+#   - Freeze everything up to and including the 512 stage
+#   - Train only: 1024 ResBlockUp + 1024 residual RGB head
+#   - D updated to accept 1024 input (starts fresh for 1024 stage)
+#   - 512 residual is already faded in (fade=0 means full scale from start)
+#   - 1024 residual starts at 0 via its own fade_images schedule
+#
+# Usage:
+#   python train.py \
+#     --config configs/phase2_1024.yaml \
+#     --init-from runs/phase1_512/ckpt_000100000.pt
+
+generator:
+  z_dim: 512
+  resolutions: [4, 8, 16, 32, 64, 128, 256, 512, 1024]
+  channels:
+    4:    512
+    8:    512
+    16:   512
+    32:   512
+    64:   256
+    128:  128
+    256:  64
+    512:  64
+    1024: 32
+  norm_type: gn
+  gn_groups: 32
+  attention_resolutions: [32]
+  residual_rgb_resolutions: [512, 1024]
+  residual_rgb_scale: 0.05
+  # 512 residual is already at full scale from Phase 1.
+  # residual_rgb_fade_images=0 means the 512 residual starts at full scale.
+  # 1024 residual is zero-initialized so it also starts safe.
+  residual_rgb_fade_images: 0
+
+discriminator:
+  resolutions: [1024, 512, 256, 128, 64, 32, 16, 8, 4]
+  channels:
+    1024: 32
+    512:  64
+    256:  64
+    128:  128
+    64:   256
+    32:   512
+    16:   512
+    8:    512
+    4:    512
+  use_spectral_norm: true
+  minibatch_std_group: 4
+  attention_resolutions: [32]
+
+training:
+  train_zip: data/train_50k_1024.zip
+  resolution: 1024
+  batch_size: 4          # 1024 is memory-heavy; reduce if OOM
+  total_images: 150_000
+  num_workers: 4
+  flip: true
+
+  precision: fp32
+  augment: color,translation
+
+  # Freeze backbone + 512 stage; train only the 1024 stage
+  freeze_g_backbone: true
+  trainable_g_resolutions: [1024]
+
+  lr_g: 0.00005          # very small: only adding fine details
+  lr_d: 0.0001
+  beta1: 0.0
+  beta2: 0.9
+  weight_decay: 0.0
+
+  residual_rgb_l2_weight: 0.1
+
+  grad_clip_g: 5.0
+  grad_clip_d: 20.0
+
+  r1_gamma: 10.0
+  r1_lazy_every: 64
+
+  ema_half_life: 10_000
+
+  ckpt_every: 10_000
+  log_every: 50
+  sample_n: 8
+  sample_seed: 42
+  seed: 42
+
+wandb:
+  project: ffhqgen-student
+  name: phase2_1024
+  mode: online
+
+out:
+  run_dir: runs/phase2_1024
