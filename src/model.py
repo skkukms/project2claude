@@ -288,8 +288,8 @@ class _SRResBlock(nn.Module):
         self.scale = scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(F.leaky_relu(x, 0.2, inplace=True))
-        h = self.conv2(F.leaky_relu(h, 0.2, inplace=True))
+        h = self.conv1(F.leaky_relu(x, 0.2))
+        h = self.conv2(F.leaky_relu(h, 0.2))
         return x + self.scale * h
 
 
@@ -304,7 +304,7 @@ class _PixelShuffleUp(nn.Module):
         nn.init.zeros_(self.conv.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.leaky_relu(self.ps(self.conv(x)), 0.2, inplace=True)
+        return F.leaky_relu(self.ps(self.conv(x)), 0.2)
 
 
 class SRRefiner(nn.Module):
@@ -339,7 +339,7 @@ class SRRefiner(nn.Module):
         anchor  = F.interpolate(
             img_in, size=(out_res, out_res), mode="bilinear", align_corners=False
         )
-        h     = F.leaky_relu(self.head(img_in), 0.2, inplace=True)
+        h     = F.leaky_relu(self.head(img_in), 0.2)
         h     = self.body(h)
         h     = self.up(h)
         h     = self.mid(h)
