@@ -46,13 +46,14 @@ except ImportError:
 
 from src.augment import diff_augment
 from src.dataset import ZipImageDataset, infinite_loader
-from src.losses import ns_logistic_g, r1_penalty
+from src.losses import ns_logistic_g, ragan_d, ragan_g, r1_penalty
 from src.model import (
     BackboneConfig,
     SRRefinerConfig,
     DiscriminatorConfig,
     Generator,
     Discriminator,
+    PatchDiscriminator,
     EMA,
 )
 
@@ -220,13 +221,23 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --- Build model ---
-    backbone_cfg   = BackboneConfig.from_dict(cfg["backbone"])
-    refiner512_cfg = SRRefinerConfig.from_dict(cfg["refiner_512"])
-    refiner1024_cfg= SRRefinerConfig.from_dict(cfg["refiner_1024"])
-    d_cfg          = DiscriminatorConfig.from_dict(cfg["discriminator"])
+    backbone_cfg    = BackboneConfig.from_dict(cfg["backbone"])
+    refiner512_cfg  = SRRefinerConfig.from_dict(cfg["refiner_512"])
+    refiner1024_cfg = SRRefinerConfig.from_dict(cfg["refiner_1024"])
 
     G = Generator(backbone_cfg, refiner512_cfg, refiner1024_cfg).to(device)
-    D = Discriminator(d_cfg).to(device)
+
+    # Discriminator: 'patch' or 'full'
+    disc_type = cfg.get("discriminator", {}).get("type", "full")
+    if disc_type == "patch":
+        use_sn = cfg["discriminator"].get("use_spectral_norm", True)
+        D = PatchDiscriminator(use_spectral_norm=use_sn).to(device)
+        d_cfg = None
+        print("Discriminator: PatchGAN (70x70)")
+    else:
+        d_cfg = DiscriminatorConfig.from_dict(cfg["discriminator"])
+        D = Discriminator(d_cfg).to(device)
+        print("Discriminator: Full-image ResNet-D")
 
     # Load & freeze backbone
     G.backbone.load_from_baseline(str(args.backbone_ckpt), device=device)
@@ -262,6 +273,10 @@ def main() -> None:
     print(f"Discriminator     : {n_d/1e6:.2f}M")
     if n_total > 40e6:
         raise ValueError(f"Generator {n_total/1e6:.2f}M exceeds 40M limit!")
+
+    # Loss type
+    loss_type = train_cfg.get("loss_type", "ns_logistic")
+    print(f"Loss type: {loss_type}")
 
     # --- Optimizers ---
     lr_g = float(train_cfg.get("lr_g", train_cfg.get("lr", 2e-4)))
@@ -408,12 +423,22 @@ def main() -> None:
         # --- D step ---
         z = torch.randn(b, z_dim, device=device)
         with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-            fake     = forward_fn(z)
-            d_real   = D(diff_augment(real, augment_policy))
-            d_fake   = D(diff_augment(fake.detach(), augment_policy))
-            l_d_real = F.softplus(-d_real).mean()
-            l_d_fake = F.softplus(d_fake).mean()
-            l_d      = l_d_real + l_d_fake
+            fake   = forward_fn(z)
+            d_real = D(diff_augment(real, augment_policy))
+            d_fake = D(diff_augment(fake.detach(), augment_policy))
+            if loss_type == "ragan":
+                l_d      = ragan_d(d_real, d_fake)
+                l_d_real = F.binary_cross_entropy_with_logits(
+                    d_real - d_fake.mean(), torch.ones_like(d_real))
+                l_d_fake = F.binary_cross_entropy_with_logits(
+                    d_fake - d_real.mean(), torch.zeros_like(d_fake))
+            else:
+                l_d_real = F.softplus(-d_real).mean()
+                l_d_fake = F.softplus(d_fake).mean()
+                l_d      = l_d_real + l_d_fake
+
+        # save d_real for G step (RaGAN needs it)
+        d_real_detached = d_real.detach()
 
         optD.zero_grad(set_to_none=True)
         l_d.backward()
@@ -435,7 +460,10 @@ def main() -> None:
         with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
             fake_g   = forward_fn(z)
             d_fake_g = D(diff_augment(fake_g, augment_policy))
-            l_g      = ns_logistic_g(d_fake_g)
+            if loss_type == "ragan":
+                l_g = ragan_g(d_real_detached, d_fake_g)
+            else:
+                l_g = ns_logistic_g(d_fake_g)
 
         optG.zero_grad(set_to_none=True)
         l_g.backward()

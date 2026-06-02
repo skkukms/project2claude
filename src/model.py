@@ -517,6 +517,57 @@ class Discriminator(nn.Module):
 
 
 # =============================================================================
+# PatchDiscriminator  (70×70 PatchGAN)
+# =============================================================================
+
+class PatchDiscriminator(nn.Module):
+    """70×70 PatchGAN discriminator.
+
+    Output shape: (B, 1, H', W') where each value covers a 70×70 receptive field.
+    Loss is computed as mean over all patch predictions.
+
+    Why better than full-image D for SR:
+    - Focuses on local texture (blur vs sharp), not global structure
+    - Generated images have right structure (backbone) but wrong texture — patches catch this
+    - More stable gradient signal at high resolution
+
+    Architecture: C64 → C128 → C256 → C512 → C1
+    (stride-2 for first n_layers, stride-1 for last two)
+    """
+
+    def __init__(self, in_ch: int = 3, base_ch: int = 64, n_layers: int = 3,
+                 use_spectral_norm: bool = True):
+        super().__init__()
+        wrap = sn if use_spectral_norm else (lambda m: m)
+
+        layers: list[nn.Module] = []
+        ch_in  = in_ch
+        ch_out = base_ch
+
+        # Strided conv layers (downsampling)
+        for i in range(n_layers):
+            layers += [
+                wrap(nn.Conv2d(ch_in, ch_out, kernel_size=4, stride=2, padding=1)),
+                nn.LeakyReLU(0.2),
+            ]
+            ch_in  = ch_out
+            ch_out = min(ch_out * 2, 512)
+
+        # stride-1 layer before output
+        layers += [
+            wrap(nn.Conv2d(ch_in, ch_out, kernel_size=4, stride=1, padding=1)),
+            nn.LeakyReLU(0.2),
+        ]
+        # Output: 1 channel patch map
+        layers += [wrap(nn.Conv2d(ch_out, 1, kernel_size=4, stride=1, padding=1))]
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)   # (B, 1, H', W') — averaged in loss
+
+
+# =============================================================================
 # EMA  (tracks the active refiner only)
 # =============================================================================
 
@@ -603,6 +654,11 @@ def build_discriminator_512() -> Discriminator:
 
 def build_discriminator_1024() -> Discriminator:
     return Discriminator(DISCRIMINATOR_1024_CONFIG)
+
+
+def build_patch_discriminator(use_spectral_norm: bool = True) -> PatchDiscriminator:
+    return PatchDiscriminator(in_ch=3, base_ch=64, n_layers=3,
+                              use_spectral_norm=use_spectral_norm)
 
 
 # =============================================================================
