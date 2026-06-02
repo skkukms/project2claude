@@ -1,14 +1,21 @@
 """Export Generator to ONNX for leaderboard submission.
 
 Submission contract:
-    input  z     : (B, 512) float32
-    output image : (B, 3, 1024, 1024) float32, range [-1, 1]
+    input  z      shape (B, 512), dtype float32
+    output image  shape (B, 3, 1024, 1024), dtype float32, range [-1, 1]
 
-Usage
------
-python export_onnx.py \\
-  --ckpt runs/phase2_residual1024/final.pt \\
-  --out  submission.onnx
+--- Refiner pipeline (G_256 + Refiner → 1024) ---
+    python export_onnx.py \\
+        --mode refiner \\
+        --refiner-ckpt runs/refiner_1024/final.pt \\
+        --g256-ckpt ckpt/ffhq256_baseline.pt \\
+        --out submission.onnx
+
+--- Baseline 256 only (bilinear upsample to 1024) ---
+    python export_onnx.py \\
+        --mode baseline \\
+        --ckpt ckpt/ffhq256_baseline.pt \\
+        --out submission.onnx
 """
 from __future__ import annotations
 
@@ -19,59 +26,104 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.model import Generator, GeneratorConfig
+from src.model import build_baseline_256_generator
+from src.refiner import Refiner, RefinerConfig
 
-TARGET_RES = 1024
+
+TARGET = 1024
 
 
-class _SubmissionWrapper(nn.Module):
+class RefinerWrapper(nn.Module):
+    """G_256 (frozen) + Refiner → 1024×1024."""
+
+    def __init__(self, G256: nn.Module, refiner: nn.Module):
+        super().__init__()
+        self.G256    = G256
+        self.refiner = refiner
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        img = self.refiner(self.G256(z))
+        if img.shape[-1] != TARGET:
+            img = F.interpolate(img, size=(TARGET, TARGET), mode="bilinear", align_corners=False)
+        return img
+
+
+class BaselineWrapper(nn.Module):
+    """G_256 → bilinear upsample to 1024×1024."""
+
     def __init__(self, G: nn.Module):
         super().__init__()
         self.G = G
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        x = self.G(z)
-        if x.shape[-1] != TARGET_RES:
-            x = F.interpolate(x, size=(TARGET_RES, TARGET_RES),
-                              mode="bilinear", align_corners=False)
-        return x
+        return F.interpolate(self.G(z), size=(TARGET, TARGET), mode="bilinear", align_corners=False)
 
 
-def export_to_onnx(ckpt_path: Path, out_path: Path, opset: int = 17) -> None:
-    ckpt  = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    g_cfg = GeneratorConfig.from_dict(ckpt["meta"]["generator_config"])
-    G     = Generator(g_cfg).eval()
-
-    state = ckpt.get("G_ema_state", ckpt.get("G_state"))
-    G.load_state_dict(state)
-
-    wrapper  = _SubmissionWrapper(G).eval()
-    dummy_z  = torch.randn(1, 512)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
+def _export(model: nn.Module, out_path: Path, opset: int = 17) -> None:
+    model.eval()
+    dummy_z = torch.randn(1, 512)
+    with torch.no_grad():
+        out = model(dummy_z)
+    print(f"Output: {tuple(out.shape)}, range [{out.min():.3f}, {out.max():.3f}]")
     torch.onnx.export(
-        wrapper, dummy_z, str(out_path),
-        input_names=["z"], output_names=["image"],
+        model, dummy_z, str(out_path),
         opset_version=opset,
+        input_names=["z"], output_names=["image"],
         dynamic_axes={"z": {0: "batch"}, "image": {0: "batch"}},
         dynamo=False,
     )
+    print(f"Saved → {out_path}")
 
-    with torch.no_grad():
-        ref = wrapper(dummy_z)
-    print(f"Saved ONNX -> {out_path}")
-    print(f"  input  z     : (B, 512)")
-    print(f"  output image : {tuple(ref.shape)}  range [{ref.min():.3f}, {ref.max():.3f}]")
-    print(f"  G params     : {sum(p.numel() for p in G.parameters())/1e6:.2f}M")
+
+def export_refiner(refiner_ckpt: Path, g256_ckpt: Path, out_path: Path, opset: int = 17) -> None:
+    device = "cpu"
+
+    G256 = build_baseline_256_generator().to(device).eval()
+    g_state = torch.load(g256_ckpt, map_location=device, weights_only=True)
+    G256.load_state_dict(g_state["G_ema_state"])
+    for p in G256.parameters(): p.requires_grad_(False)
+
+    ckpt    = torch.load(refiner_ckpt, map_location=device, weights_only=False)
+    r_cfg   = RefinerConfig(**ckpt["meta"]["refiner_config"])
+    refiner = Refiner(r_cfg).to(device).eval()
+    refiner.load_state_dict(ckpt["R_ema_state"])
+    for p in refiner.parameters(): p.requires_grad_(False)
+
+    n_g256 = sum(p.numel() for p in G256.parameters())
+    n_ref  = sum(p.numel() for p in refiner.parameters())
+    total  = n_g256 + n_ref
+    print(f"G_256: {n_g256/1e6:.2f}M | Refiner: {n_ref/1e6:.2f}M | Total: {total/1e6:.2f}M")
+    if total > 40e6:
+        raise ValueError(f"Total {total/1e6:.2f}M exceeds 40M limit!")
+
+    _export(RefinerWrapper(G256, refiner), out_path, opset)
+
+
+def export_baseline(ckpt_path: Path, out_path: Path, opset: int = 17) -> None:
+    G = build_baseline_256_generator().eval()
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    G.load_state_dict(state.get("G_ema_state") or state["G_state"])
+    _export(BaselineWrapper(G), out_path, opset)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt",  type=Path, required=True)
-    parser.add_argument("--out",   type=Path, default=Path("submission.onnx"))
-    parser.add_argument("--opset", type=int,  default=17)
+    parser.add_argument("--mode", choices=["refiner", "baseline"], default="refiner")
+    parser.add_argument("--refiner-ckpt", type=Path)
+    parser.add_argument("--g256-ckpt",    type=Path)
+    parser.add_argument("--ckpt",         type=Path, help="for --mode baseline")
+    parser.add_argument("--out",          type=Path, default=Path("submission.onnx"))
+    parser.add_argument("--opset",        type=int,  default=17)
     args = parser.parse_args()
-    export_to_onnx(args.ckpt, args.out, opset=args.opset)
+
+    if args.mode == "refiner":
+        if not args.refiner_ckpt or not args.g256_ckpt:
+            raise SystemExit("--mode refiner requires --refiner-ckpt and --g256-ckpt")
+        export_refiner(args.refiner_ckpt, args.g256_ckpt, args.out, args.opset)
+    else:
+        if not args.ckpt:
+            raise SystemExit("--mode baseline requires --ckpt")
+        export_baseline(args.ckpt, args.out, args.opset)
 
 
 if __name__ == "__main__":
