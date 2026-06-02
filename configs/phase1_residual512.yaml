@@ -1,4 +1,4 @@
-# Phase 1: 256 backbone frozen, 512 residual branch 학습
+# Phase 1: 512 end-to-end 학습 (residual head 제거, standard to_rgb at 512)
 #
 # python train.py --phase 1 \
 #   --config configs/phase1_residual512.yaml \
@@ -15,13 +15,13 @@ generator:
     64:  256
     128: 128
     256: 64
-    512: 64
+    512: 32
   norm_type: gn
   gn_groups: 32
   attention_resolutions: [32]
-  residual_rgb_resolutions: [512]
-  residual_rgb_scale: 0.1        # 0.03→0.1: residual이 이미지에 더 영향을 줄 수 있게
-  residual_rgb_fade_images: 50000  # 20000→50000: 더 천천히 fade-in해서 안정화
+  residual_rgb_resolutions: []   # residual head 제거 → standard to_rgb at 512
+  residual_rgb_scale: 0.0
+  residual_rgb_fade_images: 0
 
 discriminator:
   resolutions: [512, 256, 128, 64, 32, 16, 8, 4]
@@ -49,9 +49,9 @@ training:
   precision: fp32
   augment: color,translation
 
-  freeze_backbone: false  # unfreeze: frozen backbone signature를 D가 학습해버리는 문제
+  freeze_backbone: false
 
-  residual_rgb_l2_weight: 0.1   # backbone도 학습하므로 regularization 완화
+  residual_rgb_l2_weight: 0.0
 
   lr_g: 0.001
   lr_d: 0.001
@@ -62,7 +62,7 @@ training:
   grad_clip_g: 10.0
   grad_clip_d: 10.0
 
-  r1_gamma: 1.0    # 10→1: lr 낮을 때 강한 R1이 D를 constant-output으로 collapse시킴
+  r1_gamma: 10.0
   r1_lazy_every: 16
 
   ema_half_life: 10_000
@@ -75,10 +75,10 @@ training:
 
 wandb:
   project: ffhqgen-student
-  name: phase1_residual512
+  name: phase1_e2e512
   mode: online
   login: true
   api_key_env: WANDB_API_KEY
 
 out:
-  run_dir: /content/drive/MyDrive/project2claude/runs/phase1_residual512
+  run_dir: /content/drive/MyDrive/project2claude/runs/phase1_e2e512
