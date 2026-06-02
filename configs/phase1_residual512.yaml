@@ -53,16 +53,16 @@ training:
 
   residual_rgb_l2_weight: 0.1   # backbone도 학습하므로 regularization 완화
 
-  lr_g: 0.0002   # 전체 backbone 학습하므로 더 낮게
-  lr_d: 0.0002   # G/D 동일하게
+  lr_g: 0.001
+  lr_d: 0.001
   beta1: 0.0
   beta2: 0.9
   weight_decay: 0.0
 
   grad_clip_g: 10.0
-  grad_clip_d: 10.0   # 20.0→10.0: D gradient 폭주(~40) 억제
+  grad_clip_d: 10.0
 
-  r1_gamma: 10.0
+  r1_gamma: 1.0    # 10→1: lr 낮을 때 강한 R1이 D를 constant-output으로 collapse시킴
   r1_lazy_every: 16
 
   ema_half_life: 10_000
