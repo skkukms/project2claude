@@ -1,0 +1,68 @@
+# Phase 1: Refiner512 — G_256(frozen) → 512×512
+#
+# python train_refiner.py --phase 1 \
+#   --config configs/refiner_512.yaml \
+#   --g256-ckpt /content/drive/MyDrive/project2/ckpt/ffhq256_baseline.pt
+
+refiner:
+  base_ch: 128
+  n_res_pre: 4     # ResBlocks at 256 before upsample
+  n_res_post: 4    # ResBlocks at 512 after upsample
+  norm_type: gn
+  gn_groups: 32
+
+discriminator:
+  resolutions: [512, 256, 128, 64, 32, 16, 8, 4]
+  channels:
+    512: 32
+    256: 64
+    128: 128
+    64:  256
+    32:  256
+    16:  256
+    8:   256
+    4:   256
+  use_spectral_norm: true
+  minibatch_std_group: 4
+  attention_resolutions: [32]
+
+training:
+  train_zip: /content/drive/MyDrive/project2/train_50k_512.zip
+  resolution: 512
+  batch_size: 16
+  total_images: 300_000
+  num_workers: 4
+  flip: true
+
+  augment: color,translation
+  consistency_weight: 0.5
+
+  lr_r: 0.001
+  lr_d: 0.001
+  beta1: 0.0
+  beta2: 0.9
+  weight_decay: 0.0
+
+  grad_clip_r: 10.0
+  grad_clip_d: 10.0
+
+  r1_gamma: 10.0
+  r1_lazy_every: 16
+
+  ema_half_life: 10_000
+
+  ckpt_every: 10_000
+  log_every: 50
+  sample_n: 8
+  sample_seed: 42
+  seed: 42
+
+wandb:
+  project: ffhqgen-student
+  name: refiner_512
+  mode: online
+  login: true
+  api_key_env: WANDB_API_KEY
+
+out:
+  run_dir: /content/drive/MyDrive/project2claude/runs/refiner_512

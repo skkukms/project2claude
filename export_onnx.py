@@ -1,21 +1,16 @@
-"""Export Generator to ONNX for leaderboard submission.
+"""Export to ONNX for leaderboard submission.
 
-Submission contract:
-    input  z      shape (B, 512), dtype float32
-    output image  shape (B, 3, 1024, 1024), dtype float32, range [-1, 1]
+Full pipeline: G_256(frozen) → Refiner512(frozen) → Refiner1024 → 1024×1024
 
---- Refiner pipeline (G_256 + Refiner → 1024) ---
     python export_onnx.py \\
-        --mode refiner \\
-        --refiner-ckpt runs/refiner_1024/final.pt \\
-        --g256-ckpt ckpt/ffhq256_baseline.pt \\
-        --out submission.onnx
+        --g256-ckpt  ckpt/ffhq256_baseline.pt \\
+        --r512-ckpt  runs/refiner_512/final.pt \\
+        --r1024-ckpt runs/refiner_1024/final.pt \\
+        --out        submission.onnx
 
---- Baseline 256 only (bilinear upsample to 1024) ---
-    python export_onnx.py \\
-        --mode baseline \\
-        --ckpt ckpt/ffhq256_baseline.pt \\
-        --out submission.onnx
+Baseline only (bilinear upsample):
+    python export_onnx.py --mode baseline \\
+        --g256-ckpt ckpt/ffhq256_baseline.pt --out submission.onnx
 """
 from __future__ import annotations
 
@@ -27,36 +22,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.model import build_baseline_256_generator
-from src.refiner import Refiner, RefinerConfig
+from src.refiner import Refiner512, Refiner512Config, Refiner1024, Refiner1024Config
 
 
 TARGET = 1024
 
 
-class RefinerWrapper(nn.Module):
-    """G_256 (frozen) + Refiner → 1024×1024."""
+class FullPipeline(nn.Module):
+    """G_256 → Refiner512 → Refiner1024 → 1024×1024."""
 
-    def __init__(self, G256: nn.Module, refiner: nn.Module):
+    def __init__(self, G256: nn.Module, r512: nn.Module, r1024: nn.Module):
         super().__init__()
-        self.G256    = G256
-        self.refiner = refiner
+        self.G256  = G256
+        self.r512  = r512
+        self.r1024 = r1024
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        img = self.refiner(self.G256(z))
-        if img.shape[-1] != TARGET:
-            img = F.interpolate(img, size=(TARGET, TARGET), mode="bilinear", align_corners=False)
-        return img
+        return self.r1024(self.r512(self.G256(z)))
 
 
 class BaselineWrapper(nn.Module):
-    """G_256 → bilinear upsample to 1024×1024."""
-
     def __init__(self, G: nn.Module):
         super().__init__()
         self.G = G
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return F.interpolate(self.G(z), size=(TARGET, TARGET), mode="bilinear", align_corners=False)
+        return F.interpolate(self.G(z), size=(TARGET, TARGET),
+                             mode="bilinear", align_corners=False)
+
+
+def _check_params(model: nn.Module, label: str = "Total") -> None:
+    n = sum(p.numel() for p in model.parameters())
+    status = "OK" if n < 40e6 else "EXCEEDS 40M LIMIT!"
+    print(f"{label}: {n/1e6:.2f}M  [{status}]")
+    if n >= 40e6:
+        raise ValueError(f"{label} {n/1e6:.2f}M exceeds 40M param limit!")
 
 
 def _export(model: nn.Module, out_path: Path, opset: int = 17) -> None:
@@ -75,55 +75,59 @@ def _export(model: nn.Module, out_path: Path, opset: int = 17) -> None:
     print(f"Saved → {out_path}")
 
 
-def export_refiner(refiner_ckpt: Path, g256_ckpt: Path, out_path: Path, opset: int = 17) -> None:
-    device = "cpu"
-
-    G256 = build_baseline_256_generator().to(device).eval()
-    g_state = torch.load(g256_ckpt, map_location=device, weights_only=True)
-    G256.load_state_dict(g_state["G_ema_state"])
+def load_g256(path: Path, device: str = "cpu"):
+    G256  = build_baseline_256_generator().to(device).eval()
+    state = torch.load(path, map_location=device, weights_only=True)
+    G256.load_state_dict(state["G_ema_state"])
     for p in G256.parameters(): p.requires_grad_(False)
-
-    ckpt    = torch.load(refiner_ckpt, map_location=device, weights_only=False)
-    r_cfg   = RefinerConfig(**ckpt["meta"]["refiner_config"])
-    refiner = Refiner(r_cfg).to(device).eval()
-    refiner.load_state_dict(ckpt["R_ema_state"])
-    for p in refiner.parameters(): p.requires_grad_(False)
-
-    n_g256 = sum(p.numel() for p in G256.parameters())
-    n_ref  = sum(p.numel() for p in refiner.parameters())
-    total  = n_g256 + n_ref
-    print(f"G_256: {n_g256/1e6:.2f}M | Refiner: {n_ref/1e6:.2f}M | Total: {total/1e6:.2f}M")
-    if total > 40e6:
-        raise ValueError(f"Total {total/1e6:.2f}M exceeds 40M limit!")
-
-    _export(RefinerWrapper(G256, refiner), out_path, opset)
+    print(f"G_256: {sum(p.numel() for p in G256.parameters())/1e6:.2f}M")
+    return G256
 
 
-def export_baseline(ckpt_path: Path, out_path: Path, opset: int = 17) -> None:
-    G = build_baseline_256_generator().eval()
-    state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    G.load_state_dict(state.get("G_ema_state") or state["G_state"])
-    _export(BaselineWrapper(G), out_path, opset)
+def load_r512(path: Path, device: str = "cpu"):
+    ckpt  = torch.load(path, map_location=device, weights_only=False)
+    cfg   = Refiner512Config(**ckpt["meta"]["refiner_config"])
+    r512  = Refiner512(cfg).to(device).eval()
+    r512.load_state_dict(ckpt["refiner_ema_state"])
+    for p in r512.parameters(): p.requires_grad_(False)
+    print(f"Refiner512: {sum(p.numel() for p in r512.parameters())/1e6:.2f}M")
+    return r512
+
+
+def load_r1024(path: Path, device: str = "cpu"):
+    ckpt   = torch.load(path, map_location=device, weights_only=False)
+    cfg    = Refiner1024Config(**ckpt["meta"]["refiner_config"])
+    r1024  = Refiner1024(cfg).to(device).eval()
+    r1024.load_state_dict(ckpt["refiner_ema_state"])
+    for p in r1024.parameters(): p.requires_grad_(False)
+    print(f"Refiner1024: {sum(p.numel() for p in r1024.parameters())/1e6:.2f}M")
+    return r1024
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["refiner", "baseline"], default="refiner")
-    parser.add_argument("--refiner-ckpt", type=Path)
-    parser.add_argument("--g256-ckpt",    type=Path)
-    parser.add_argument("--ckpt",         type=Path, help="for --mode baseline")
-    parser.add_argument("--out",          type=Path, default=Path("submission.onnx"))
-    parser.add_argument("--opset",        type=int,  default=17)
+    parser.add_argument("--mode",      choices=["full", "baseline"], default="full")
+    parser.add_argument("--g256-ckpt",  required=True, type=Path)
+    parser.add_argument("--r512-ckpt",  type=Path)
+    parser.add_argument("--r1024-ckpt", type=Path)
+    parser.add_argument("--out",        type=Path, default=Path("submission.onnx"))
+    parser.add_argument("--opset",      type=int,  default=17)
     args = parser.parse_args()
 
-    if args.mode == "refiner":
-        if not args.refiner_ckpt or not args.g256_ckpt:
-            raise SystemExit("--mode refiner requires --refiner-ckpt and --g256-ckpt")
-        export_refiner(args.refiner_ckpt, args.g256_ckpt, args.out, args.opset)
+    if args.mode == "full":
+        if not args.r512_ckpt or not args.r1024_ckpt:
+            raise SystemExit("--mode full requires --r512-ckpt and --r1024-ckpt")
+        G256  = load_g256(args.g256_ckpt)
+        r512  = load_r512(args.r512_ckpt)
+        r1024 = load_r1024(args.r1024_ckpt)
+        model = FullPipeline(G256, r512, r1024)
+        _check_params(model)
+        _export(model, args.out, args.opset)
     else:
-        if not args.ckpt:
-            raise SystemExit("--mode baseline requires --ckpt")
-        export_baseline(args.ckpt, args.out, args.opset)
+        G256  = load_g256(args.g256_ckpt)
+        model = BaselineWrapper(G256)
+        _check_params(model)
+        _export(model, args.out, args.opset)
 
 
 if __name__ == "__main__":

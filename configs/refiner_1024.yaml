@@ -1,14 +1,14 @@
-# Refiner: frozen G_256 → Refiner → 1024×1024
+# Phase 2: Refiner1024 — Refiner512(frozen) → 1024×1024
 #
-# python train_refiner.py \
+# python train_refiner.py --phase 2 \
 #   --config configs/refiner_1024.yaml \
-#   --g256-ckpt /content/drive/MyDrive/project2/ckpt/ffhq256_baseline.pt
+#   --g256-ckpt /content/drive/MyDrive/project2/ckpt/ffhq256_baseline.pt \
+#   --r512-ckpt /content/drive/MyDrive/project2claude/runs/refiner_512/final.pt
 
 refiner:
-  base_ch: 128         # channels throughout (budget: ~18M available)
-  n_res_before: 4      # ResBlocks at 256 (feature extraction)
-  n_res_mid: 2         # ResBlocks at 512
-  n_res_after: 2       # ResBlocks at 1024
+  base_ch: 128
+  n_res_pre: 4     # ResBlocks at 512 before upsample
+  n_res_post: 2    # ResBlocks at 1024 after upsample
   norm_type: gn
   gn_groups: 32
 
@@ -32,13 +32,12 @@ training:
   train_zip: /content/drive/MyDrive/project2/train_50k_1024.zip
   resolution: 1024
   batch_size: 8
-  total_images: 500_000
+  total_images: 200_000
   num_workers: 4
   flip: true
 
   augment: color,translation
-
-  consistency_weight: 0.5   # L1(downsample(out_1024) - out_256)
+  consistency_weight: 0.5
 
   lr_r: 0.001
   lr_d: 0.001

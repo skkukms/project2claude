@@ -1,46 +1,27 @@
-"""Refiner: 256×256 → 1024×1024 upsampler trained adversarially.
+"""Two-stage Refiner: G_256(frozen) → Refiner512 → Refiner1024.
 
-Architecture:
-  from_rgb  : Conv(3 → ch)
-  resblocks  : N plain ResBlocks at 256 (feature extraction)
-  upsample1  : ResBlockUp(ch → ch) → 512×512
-  resblocks  : M plain ResBlocks at 512
-  upsample2  : ResBlockUp(ch → ch//2) → 1024×1024
-  resblocks  : K plain ResBlocks at 1024
-  to_rgb     : norm → relu → Conv(ch//2 → 3) → tanh
+Phase 1: train Refiner512  (256→512)  with D_512
+Phase 2: train Refiner1024 (512→1024) with D_1024, Refiner512 frozen
 
-Consistency loss: ||downsample(output_1024, 256) - input_256||₁
-keeps the coarse structure intact.
+Both refiners use a residual design:
+    output = tanh(bilinear_upsample(input) + learned_residual)
+Zero-init on to_rgb ensures safe start (pure bilinear at step 0).
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.model import make_norm, sn
+from src.model import make_norm
 
 
 # ---------------------------------------------------------------------------
-
-@dataclass
-class RefinerConfig:
-    base_ch: int = 128
-    n_res_before: int = 4    # ResBlocks at 256 before first upsample
-    n_res_mid: int = 2       # ResBlocks at 512
-    n_res_after: int = 2     # ResBlocks at 1024
-    norm_type: str = "gn"
-    gn_groups: int = 32
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "RefinerConfig":
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
-
-
+# Building blocks
 # ---------------------------------------------------------------------------
 
 class ResBlock(nn.Module):
@@ -60,7 +41,7 @@ class ResBlock(nn.Module):
 
 
 class ResBlockUp(nn.Module):
-    """Pre-activation upsample residual block (mirrors baseline Generator)."""
+    """Pre-activation 2× upsample residual block."""
 
     def __init__(self, in_ch: int, out_ch: int, norm_type: str = "gn", gn_groups: int = 32):
         super().__init__()
@@ -79,47 +60,85 @@ class ResBlockUp(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Configs
+# ---------------------------------------------------------------------------
 
-class Refiner(nn.Module):
-    """256×256 → 1024×1024 residual upsampler."""
+@dataclass
+class Refiner512Config:
+    base_ch: int = 128
+    n_res_pre: int  = 4   # ResBlocks at 256 before upsample
+    n_res_post: int = 4   # ResBlocks at 512 after upsample
+    norm_type: str  = "gn"
+    gn_groups: int  = 32
 
-    def __init__(self, cfg: RefinerConfig):
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Refiner512Config":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class Refiner1024Config:
+    base_ch: int = 128
+    n_res_pre: int  = 4   # ResBlocks at 512 before upsample
+    n_res_post: int = 2   # ResBlocks at 1024 after upsample
+    norm_type: str  = "gn"
+    gn_groups: int  = 32
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Refiner1024Config":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+
+class Refiner512(nn.Module):
+    """256×256 → 512×512.  Input: G_256 output in [-1,1]."""
+
+    def __init__(self, cfg: Refiner512Config):
         super().__init__()
         self.cfg = cfg
-        ch   = cfg.base_ch
-        ch2  = ch // 2
-        nt   = cfg.norm_type
-        gng  = cfg.gn_groups
+        ch, nt, gng = cfg.base_ch, cfg.norm_type, cfg.gn_groups
 
-        self.from_rgb = nn.Conv2d(3, ch, 3, padding=1)
+        self.from_rgb  = nn.Conv2d(3, ch, 3, padding=1)
+        self.res_pre   = nn.Sequential(*[ResBlock(ch, nt, gng) for _ in range(cfg.n_res_pre)])
+        self.up        = ResBlockUp(ch, ch, nt, gng)   # 256 → 512
+        self.res_post  = nn.Sequential(*[ResBlock(ch, nt, gng) for _ in range(cfg.n_res_post)])
+        self.out_norm  = make_norm(ch, nt, gng)
+        self.to_rgb    = nn.Conv2d(ch, 3, 3, padding=1)
 
-        self.res_before = nn.Sequential(
-            *[ResBlock(ch, nt, gng) for _ in range(cfg.n_res_before)]
-        )
-        self.up1 = ResBlockUp(ch, ch, nt, gng)          # 256 → 512
-        self.res_mid = nn.Sequential(
-            *[ResBlock(ch, nt, gng) for _ in range(cfg.n_res_mid)]
-        )
-        self.up2 = ResBlockUp(ch, ch2, nt, gng)         # 512 → 1024
-        self.res_after = nn.Sequential(
-            *[ResBlock(ch2, nt, gng) for _ in range(cfg.n_res_after)]
-        )
-
-        self.out_norm = make_norm(ch2, nt, gng)
-        self.to_rgb   = nn.Conv2d(ch2, 3, 3, padding=1)
-
-        # Zero-init to_rgb so output starts as pure bilinear upsample
         nn.init.zeros_(self.to_rgb.weight)
         nn.init.zeros_(self.to_rgb.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: 3×256×256  (output of frozen G_256, in [-1,1])
-        h = self.from_rgb(x)
-        h = self.res_before(h)
-        h = self.up1(h)
-        h = self.res_mid(h)
-        h = self.up2(h)
-        h = self.res_after(h)
+        h        = self.res_post(self.up(self.res_pre(self.from_rgb(x))))
         residual = self.to_rgb(F.relu(self.out_norm(h)))
-        base = F.interpolate(x, scale_factor=4.0, mode="bilinear", align_corners=False)
+        base     = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+        return torch.tanh(base + residual)
+
+
+class Refiner1024(nn.Module):
+    """512×512 → 1024×1024.  Input: Refiner512 output in [-1,1]."""
+
+    def __init__(self, cfg: Refiner1024Config):
+        super().__init__()
+        self.cfg = cfg
+        ch, nt, gng = cfg.base_ch, cfg.norm_type, cfg.gn_groups
+        ch2 = ch // 2
+
+        self.from_rgb  = nn.Conv2d(3, ch, 3, padding=1)
+        self.res_pre   = nn.Sequential(*[ResBlock(ch, nt, gng) for _ in range(cfg.n_res_pre)])
+        self.up        = ResBlockUp(ch, ch2, nt, gng)  # 512 → 1024
+        self.res_post  = nn.Sequential(*[ResBlock(ch2, nt, gng) for _ in range(cfg.n_res_post)])
+        self.out_norm  = make_norm(ch2, nt, gng)
+        self.to_rgb    = nn.Conv2d(ch2, 3, 3, padding=1)
+
+        nn.init.zeros_(self.to_rgb.weight)
+        nn.init.zeros_(self.to_rgb.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h        = self.res_post(self.up(self.res_pre(self.from_rgb(x))))
+        residual = self.to_rgb(F.relu(self.out_norm(h)))
+        base     = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
         return torch.tanh(base + residual)
