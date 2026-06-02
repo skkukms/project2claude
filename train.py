@@ -286,34 +286,16 @@ def main() -> None:
     if args.init_from:
         init_from_checkpoint(args.init_from, G, D, G_ema, device=device)
 
+    # Load G/D weights first (optimizer state loaded after freeze+rebuild below)
+    resume_ckpt = None
     if args.resume:
         print(f"Resuming from {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        G.load_state_dict(ckpt["G_state"])
-        D.load_state_dict(ckpt["D_state"])
-        G_ema.load_state_dict(ckpt["G_ema_state"])
-        if "optG_state" in ckpt:
-            optG.load_state_dict(ckpt["optG_state"])
-        if "optD_state" in ckpt:
-            optD.load_state_dict(ckpt["optD_state"])
-        for pg in optG.param_groups:
-            pg["lr"] = lr_g
-        for pg in optD.param_groups:
-            pg["lr"] = lr_d
-        images_seen  = ckpt.get("images_seen", 0)
-        step         = ckpt.get("step", 0)
-        wandb_run_id = None if args.new_wandb_run else ckpt.get("wandb_run_id")
-        rng = ckpt.get("rng_state", {})
-        if rng.get("torch") is not None:
-            torch.set_rng_state(rng["torch"].cpu())
-        if torch.cuda.is_available() and rng.get("cuda"):
-            torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
-        if rng.get("numpy"):
-            np.random.set_state(rng["numpy"])
-        if rng.get("python"):
-            random.setstate(rng["python"])
+        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        G.load_state_dict(resume_ckpt["G_state"])
+        D.load_state_dict(resume_ckpt["D_state"])
+        G_ema.load_state_dict(resume_ckpt["G_ema_state"])
 
-    # Apply freeze based on phase
+    # Apply freeze before rebuilding optimizer so param groups are correct
     freeze_cfg = train_cfg.get("freeze_resolutions", [])
     needs_freeze = bool(freeze_cfg) or train_cfg.get("freeze_backbone", False)
 
@@ -322,15 +304,36 @@ def main() -> None:
     elif train_cfg.get("freeze_backbone", False):
         G.freeze_backbone()
 
-    # Rebuild optimizer with only trainable params.
-    # Must happen AFTER resume so we don't clobber loaded optimizer state
-    # for the wrong param group. For --resume, optimizer state was already
-    # loaded above and param groups match the frozen layout.
-    if needs_freeze and not args.resume:
+    # Rebuild optG with only trainable params whenever freeze is active.
+    # This must happen before loading optimizer state so param groups match.
+    if needs_freeze:
         optG = torch.optim.Adam(
             filter(lambda p: p.requires_grad, G.parameters()),
             lr=lr_g, betas=(beta1, beta2), eps=1e-8, weight_decay=wd,
         )
+
+    # Now load optimizer state (param groups already match frozen layout)
+    if resume_ckpt is not None:
+        if "optG_state" in resume_ckpt:
+            optG.load_state_dict(resume_ckpt["optG_state"])
+        if "optD_state" in resume_ckpt:
+            optD.load_state_dict(resume_ckpt["optD_state"])
+        for pg in optG.param_groups:
+            pg["lr"] = lr_g
+        for pg in optD.param_groups:
+            pg["lr"] = lr_d
+        images_seen  = resume_ckpt.get("images_seen", 0)
+        step         = resume_ckpt.get("step", 0)
+        wandb_run_id = None if args.new_wandb_run else resume_ckpt.get("wandb_run_id")
+        rng = resume_ckpt.get("rng_state", {})
+        if rng.get("torch") is not None:
+            torch.set_rng_state(rng["torch"].cpu())
+        if torch.cuda.is_available() and rng.get("cuda"):
+            torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
+        if rng.get("numpy"):
+            np.random.set_state(rng["numpy"])
+        if rng.get("python"):
+            random.setstate(rng["python"])
 
     # W&B
     wandb_cfg  = cfg.get("wandb", {})

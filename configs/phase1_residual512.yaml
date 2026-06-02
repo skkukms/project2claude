@@ -20,8 +20,8 @@ generator:
   gn_groups: 32
   attention_resolutions: [32]
   residual_rgb_resolutions: [512]
-  residual_rgb_scale: 0.03
-  residual_rgb_fade_images: 20000
+  residual_rgb_scale: 0.1        # 0.03→0.1: residual이 이미지에 더 영향을 줄 수 있게
+  residual_rgb_fade_images: 50000  # 20000→50000: 더 천천히 fade-in해서 안정화
 
 discriminator:
   resolutions: [512, 256, 128, 64, 32, 16, 8, 4]
@@ -51,16 +51,16 @@ training:
 
   freeze_backbone: true   # 256 backbone 고정, 512 stage만 학습
 
-  residual_rgb_l2_weight: 0.1   # residual이 너무 커지지 않게
+  residual_rgb_l2_weight: 0.5   # 0.1→0.5: adv loss(~29)에 대해 충분한 regularization
 
-  lr_g: 0.001
-  lr_d: 0.0002   # D를 G보다 느리게 → 격차 완화
+  lr_g: 0.0005   # 0.001→0.0005: G gradient 불안정 억제
+  lr_d: 0.0002   # D를 G보다 느리게 유지
   beta1: 0.0
   beta2: 0.9
   weight_decay: 0.0
 
   grad_clip_g: 10.0
-  grad_clip_d: 20.0
+  grad_clip_d: 10.0   # 20.0→10.0: D gradient 폭주(~40) 억제
 
   r1_gamma: 10.0
   r1_lazy_every: 16
