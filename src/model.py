@@ -1,36 +1,35 @@
-"""Cascade SR-Refiner GAN — z → 256 → 512 → 1024.
+"""Residual Progressive GAN — 256 → 512 → 1024.
 
 Architecture
 ------------
-Generator(z) = SRRefiner_1024( SRRefiner_512( BackboneGenerator(z) ) )
+Generator(z) produces images progressively:
+  - 4×4 → ... → 256×256  (backbone, pretrained & frozen)
+  - 256 → 512  : upsample(base_256) + scale * residual_conv(feat_512)
+  - 512 → 1024 : upsample(out_512)  + scale * residual_conv(feat_1024)
+
+Residual convs are zero-initialized → output is pure bilinear at init.
+Fade-in schedule: scale goes 0 → residual_rgb_scale over N images.
+
+Key fixes vs original baseline
+--------------------------------
+1. ResBlockDown skip path uses shared pre-activation (bug: original had
+   activation on main path only, none on skip).
+2. Generator stages stored in ModuleList + ModuleDict instead of a mixed
+   nn.Sequential with manual index arithmetic.
+3. EMA checks parameter/buffer count strictly (no silent truncation).
 
 Training phases
 ---------------
-Phase 1:  BackboneG (frozen) + SRRefiner_512 (train)  →  512×512 output
-          Discriminator at 512, real images from train_50k_512.zip
-
-Phase 2:  BackboneG (frozen) + SRRefiner_512 (frozen) + SRRefiner_1024 (train)
-          →  1024×1024 output
-          Discriminator at 1024, real images from train_50k_1024.zip
-
-Inference / ONNX export:
-  G(z) runs all three modules in sequence → 1024×1024.
-  freeze only affects requires_grad, not the forward pass.
-
-SRRefiner design (ESRGAN-inspired)
-------------------------------------
-- No normalization: avoids mean-shift artifacts on image-space features
-- PixelShuffle 2× upsampling: sharper than nearest-neighbor (learned kernel)
-- Zero-initialized tail conv: output starts as bilinear upsample at init,
-  so training is stable from step 0 without any fade-in schedule
-- Residual scale 0.2 on SRResBlocks: prevents gradient explosion
+Phase 1: freeze backbone (4→256), train 512 stage + 512 residual head
+Phase 2: freeze backbone + 512 stage, train 1024 stage + 1024 residual head
 """
 from __future__ import annotations
 
 import copy
 import math
+import warnings
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -39,17 +38,17 @@ from torch.nn.utils.parametrizations import spectral_norm as _sn
 
 
 # =============================================================================
-# Config dataclasses
+# Config
 # =============================================================================
 
-def _norm_ch(channels: dict[Any, Any]) -> dict[int, int]:
-    return {int(k): int(v) for k, v in channels.items()}
+def _norm_ch(ch: dict[Any, Any]) -> dict[int, int]:
+    return {int(k): int(v) for k, v in ch.items()}
 
 
-def _check_progressive(resolutions: list[int], *, descending: bool) -> None:
-    if not resolutions:
+def _check_progressive(res: list[int], *, descending: bool) -> None:
+    if not res:
         raise ValueError("resolutions must not be empty")
-    for cur, nxt in zip(resolutions, resolutions[1:]):
+    for cur, nxt in zip(res, res[1:]):
         expected = cur // 2 if descending else cur * 2
         if nxt != expected:
             direction = "halve" if descending else "double"
@@ -57,48 +56,42 @@ def _check_progressive(resolutions: list[int], *, descending: bool) -> None:
 
 
 @dataclass
-class BackboneConfig:
+class GeneratorConfig:
     z_dim: int
-    resolutions: list[int]
+    resolutions: list[int]            # e.g. [4,8,16,32,64,128,256,512,1024]
     channels: dict[int, int]
     norm_type: str = "gn"
     gn_groups: int = 32
     attention_resolutions: list[int] = field(default_factory=list)
+    # Residual RGB branches (e.g. [512] or [512, 1024])
+    residual_rgb_resolutions: list[int] = field(default_factory=list)
+    residual_rgb_scale: float = 0.03
+    residual_rgb_fade_images: int = 20_000  # 0 = full scale from start
 
     def __post_init__(self) -> None:
         self.resolutions = [int(r) for r in self.resolutions]
         self.channels    = _norm_ch(self.channels)
-        self.attention_resolutions = [int(r) for r in self.attention_resolutions]
+        self.attention_resolutions    = [int(r) for r in self.attention_resolutions]
+        self.residual_rgb_resolutions = [int(r) for r in self.residual_rgb_resolutions]
+        self.residual_rgb_scale       = float(self.residual_rgb_scale)
+        self.residual_rgb_fade_images = int(self.residual_rgb_fade_images)
         if self.z_dim <= 0:
             raise ValueError("z_dim must be positive")
+        if self.norm_type not in ("gn", "in"):
+            raise ValueError(f"norm_type must be 'gn' or 'in', got {self.norm_type!r}")
         _check_progressive(self.resolutions, descending=False)
         for r in self.resolutions:
             if r not in self.channels:
                 raise ValueError(f"channels missing for resolution {r}")
+        for r in self.attention_resolutions:
+            if r not in self.resolutions:
+                raise ValueError(f"attention resolution {r} not in G stages")
+        for r in self.residual_rgb_resolutions:
+            if r not in self.resolutions[1:]:
+                raise ValueError(f"residual_rgb_resolution {r} must be an upsampled stage")
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "BackboneConfig":
-        return cls(**d)
-
-
-@dataclass
-class SRRefinerConfig:
-    """Config for a single 2× SR stage (e.g. 256→512 or 512→1024)."""
-    in_resolution: int
-    out_resolution: int
-    mid_ch: int = 64
-    n_res_blocks: int = 8   # body blocks before upsample
-    n_mid_blocks: int = 4   # blocks after upsample
-
-    def __post_init__(self) -> None:
-        if self.out_resolution != self.in_resolution * 2:
-            raise ValueError(
-                f"SRRefinerConfig: out_resolution must be exactly 2x in_resolution, "
-                f"got {self.in_resolution} -> {self.out_resolution}"
-            )
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "SRRefinerConfig":
+    def from_dict(cls, d: dict[str, Any]) -> "GeneratorConfig":
         return cls(**d)
 
 
@@ -114,8 +107,6 @@ class DiscriminatorConfig:
         self.resolutions = [int(r) for r in self.resolutions]
         self.channels    = _norm_ch(self.channels)
         self.attention_resolutions = [int(r) for r in self.attention_resolutions]
-        if self.minibatch_std_group <= 0:
-            raise ValueError("minibatch_std_group must be positive")
         _check_progressive(self.resolutions, descending=True)
         for r in self.resolutions:
             if r not in self.channels:
@@ -127,13 +118,17 @@ class DiscriminatorConfig:
 
 
 # =============================================================================
-# Shared helpers
+# Helpers
 # =============================================================================
 
 def make_norm(channels: int, norm_type: str, gn_groups: int) -> nn.Module:
     if norm_type == "gn":
         groups = min(gn_groups, channels)
         if channels % groups != 0:
+            warnings.warn(
+                f"GroupNorm fallback: channels={channels} not divisible by "
+                f"groups={groups}, using groups={channels}"
+            )
             groups = channels
         return nn.GroupNorm(num_groups=groups, num_channels=channels)
     if norm_type == "in":
@@ -146,11 +141,17 @@ def sn(m: nn.Module) -> nn.Module:
 
 
 # =============================================================================
-# BackboneGenerator  (identical structure to 256 baseline for strict load)
+# Building blocks
 # =============================================================================
 
-class _BackboneResBlockUp(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, norm_type: str, gn_groups: int):
+class ResBlockUp(nn.Module):
+    """Pre-activation upsample residual block for Generator.
+
+    main: NN-upsample 2x → norm → ReLU → Conv3x3 → norm → ReLU → Conv3x3
+    skip: NN-upsample 2x → Conv1x1 (or Identity when in_ch == out_ch)
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, norm_type: str = "gn", gn_groups: int = 32):
         super().__init__()
         self.norm1 = make_norm(in_ch,  norm_type, gn_groups)
         self.conv1 = nn.Conv2d(in_ch,  out_ch, 3, padding=1)
@@ -166,260 +167,15 @@ class _BackboneResBlockUp(nn.Module):
         return h + skip
 
 
-class _BackboneSelfAttn(nn.Module):
-    def __init__(self, channels: int):
-        super().__init__()
-        cs = max(1, channels // 8)
-        cm = max(1, channels // 2)
-        self.theta = nn.Conv2d(channels, cs, 1, bias=False)
-        self.phi   = nn.Conv2d(channels, cs, 1, bias=False)
-        self.g     = nn.Conv2d(channels, cm, 1, bias=False)
-        self.o     = nn.Conv2d(cm, channels, 1, bias=False)
-        self.gamma = nn.Parameter(torch.zeros(1))
+class ResBlockDown(nn.Module):
+    """Pre-activation downsample residual block for Discriminator.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        N     = H * W
-        theta = self.theta(x).view(B, -1, N)
-        phi   = F.max_pool2d(self.phi(x), 2).view(B, -1, N // 4)
-        attn  = F.softmax(torch.bmm(theta.transpose(1, 2), phi), dim=-1)
-        g     = F.max_pool2d(self.g(x), 2).view(B, -1, N // 4)
-        y     = torch.bmm(g, attn.transpose(1, 2)).view(B, -1, H, W)
-        return self.gamma * self.o(y) + x
+    FIX vs baseline: skip path uses same pre-activation as main path.
 
-
-class BackboneGenerator(nn.Module):
-    """256×256 pretrained backbone — always frozen after loading."""
-
-    def __init__(self, cfg: BackboneConfig):
-        super().__init__()
-        self.cfg      = cfg
-        self.z_dim    = cfg.z_dim
-        first_res     = cfg.resolutions[0]
-        first_ch      = cfg.channels[first_res]
-        self.first_res = first_res
-        self.first_ch  = first_ch
-
-        self.input_proj = nn.Linear(cfg.z_dim, first_ch * first_res * first_res)
-        self.res_blocks:  nn.ModuleList = nn.ModuleList()
-        self.attn_blocks: nn.ModuleDict = nn.ModuleDict()
-
-        for i in range(1, len(cfg.resolutions)):
-            in_ch  = cfg.channels[cfg.resolutions[i - 1]]
-            out_ch = cfg.channels[cfg.resolutions[i]]
-            res_out = cfg.resolutions[i]
-            self.res_blocks.append(
-                _BackboneResBlockUp(in_ch, out_ch, cfg.norm_type, cfg.gn_groups)
-            )
-            if res_out in cfg.attention_resolutions:
-                self.attn_blocks[str(res_out)] = _BackboneSelfAttn(out_ch)
-
-        last_ch       = cfg.channels[cfg.resolutions[-1]]
-        self.out_norm = make_norm(last_ch, cfg.norm_type, cfg.gn_groups)
-        self.to_rgb   = nn.Conv2d(last_ch, 3, 3, padding=1)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        h = self.input_proj(z).view(-1, self.first_ch, self.first_res, self.first_res)
-        for i, res_out in enumerate(self.cfg.resolutions[1:]):
-            h = self.res_blocks[i](h)
-            if str(res_out) in self.attn_blocks:
-                h = self.attn_blocks[str(res_out)](h)
-        return torch.tanh(self.to_rgb(F.relu(self.out_norm(h))))
-
-    def freeze(self) -> None:
-        for p in self.parameters():
-            p.requires_grad_(False)
-        self.eval()
-
-    def load_from_baseline(self, ckpt_path: str, device: str = "cpu") -> None:
-        ckpt  = torch.load(ckpt_path, map_location=device, weights_only=False)
-        state = ckpt.get("G_ema_state", ckpt.get("G_state"))
-        if state is None:
-            raise KeyError("Checkpoint has neither 'G_ema_state' nor 'G_state'")
-        try:
-            self.load_state_dict(state, strict=True)
-            print("BackboneGenerator: strict load OK")
-        except RuntimeError:
-            remapped = _remap_baseline_keys(state)
-            missing, unexpected = self.load_state_dict(remapped, strict=False)
-            print(
-                f"BackboneGenerator: partial load — "
-                f"missing={len(missing)}, unexpected={len(unexpected)}"
-            )
-
-
-def _remap_baseline_keys(state: dict) -> dict:
-    """Remap stages.N keys (mixed Sequential) → res_blocks.N / attn_blocks.R."""
-    RESOLUTIONS = [4, 8, 16, 32, 64, 128, 256]
-    ATTN_RES    = {32}
-    stage_to_new: dict[int, str] = {}
-    stage_idx = rb_idx = 0
-    for i in range(1, len(RESOLUTIONS)):
-        res_out = RESOLUTIONS[i]
-        stage_to_new[stage_idx] = f"res_blocks.{rb_idx}"
-        stage_idx += 1
-        rb_idx    += 1
-        if res_out in ATTN_RES:
-            stage_to_new[stage_idx] = f"attn_blocks.{res_out}"
-            stage_idx += 1
-    new_state = {}
-    for k, v in state.items():
-        if k.startswith("stages."):
-            parts = k.split(".", 2)
-            prefix = stage_to_new.get(int(parts[1]))
-            if prefix is not None:
-                new_state[f"{prefix}.{parts[2]}" if len(parts) > 2 else prefix] = v
-        else:
-            new_state[k] = v
-    return new_state
-
-
-# =============================================================================
-# SRRefiner  — single 2× upscale stage (reused for 256→512 and 512→1024)
-# =============================================================================
-
-class _SRResBlock(nn.Module):
-    """ESRGAN-style residual block: no norm, identity skip, small residual scale."""
-
-    def __init__(self, ch: int, scale: float = 0.2):
-        super().__init__()
-        self.conv1 = nn.Conv2d(ch, ch, 3, padding=1)
-        self.conv2 = nn.Conv2d(ch, ch, 3, padding=1)
-        self.scale = scale
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(F.leaky_relu(x, 0.2))
-        h = self.conv2(F.leaky_relu(h, 0.2))
-        return x + self.scale * h
-
-
-class _PixelShuffleUp(nn.Module):
-    """Learned 2× upsampling via sub-pixel convolution."""
-
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch * 4, 3, padding=1)
-        self.ps   = nn.PixelShuffle(2)
-        nn.init.orthogonal_(self.conv.weight)
-        nn.init.zeros_(self.conv.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.leaky_relu(self.ps(self.conv(x)), 0.2)
-
-
-class SRRefiner(nn.Module):
-    """Single 2× SR stage (in_res → out_res = 2×in_res).
-
-    Reused for both 256→512 (Phase 1) and 512→1024 (Phase 2).
-
-    The output is:
-        bilinear_upsample(input) + tanh(learned_delta)
-    so the network starts as a pure bilinear upsampler (tail is zero-init)
-    and gradually learns to add high-frequency corrections.
+    main: leaky_relu(x) → Conv3x3 → leaky_relu → Conv3x3 → AvgPool 2x
+    skip: leaky_relu(x) → Conv1x1 → AvgPool 2x
+    sum scaled by 1/sqrt(2).
     """
-
-    def __init__(self, cfg: SRRefinerConfig):
-        super().__init__()
-        self.cfg    = cfg
-        self.in_res = cfg.in_resolution
-        ch          = cfg.mid_ch
-
-        self.head = nn.Conv2d(3, ch, 3, padding=1)
-        self.body = nn.Sequential(*[_SRResBlock(ch) for _ in range(cfg.n_res_blocks)])
-        self.up   = _PixelShuffleUp(ch, ch)
-        self.mid  = nn.Sequential(*[_SRResBlock(ch) for _ in range(cfg.n_mid_blocks)])
-        self.tail = nn.Conv2d(ch, 3, 3, padding=1)
-
-        # Zero-init: starts as identity (bilinear anchor)
-        nn.init.zeros_(self.tail.weight)
-        nn.init.zeros_(self.tail.bias)
-
-    def forward(self, img_in: torch.Tensor) -> torch.Tensor:
-        out_res = self.cfg.out_resolution
-        anchor  = F.interpolate(
-            img_in, size=(out_res, out_res), mode="bilinear", align_corners=False
-        )
-        h     = F.leaky_relu(self.head(img_in), 0.2)
-        h     = self.body(h)
-        h     = self.up(h)
-        h     = self.mid(h)
-        delta = torch.tanh(self.tail(h))
-        return (anchor + delta).clamp(-1.0, 1.0)
-
-    def freeze(self) -> None:
-        for p in self.parameters():
-            p.requires_grad_(False)
-        self.eval()
-
-
-# =============================================================================
-# Full Generator  (Backbone + SR_512 + SR_1024)
-# =============================================================================
-
-class Generator(nn.Module):
-    """Full 1024×1024 generator for submission.
-
-    G(z) = SR_1024( SR_512( Backbone(z) ) )
-
-    Freeze semantics:
-      Phase 1 training: backbone.freeze()
-      Phase 2 training: backbone.freeze() + sr_512.freeze()
-      Inference / ONNX: all three run (freeze only affects requires_grad)
-    """
-
-    def __init__(
-        self,
-        backbone_cfg:  BackboneConfig,
-        refiner512_cfg: SRRefinerConfig,
-        refiner1024_cfg: SRRefinerConfig,
-    ):
-        super().__init__()
-        self.backbone   = BackboneGenerator(backbone_cfg)
-        self.sr_512     = SRRefiner(refiner512_cfg)
-        self.sr_1024    = SRRefiner(refiner1024_cfg)
-        self.z_dim      = backbone_cfg.z_dim
-
-    # --- inference (all modules) ---
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        img_256  = self.backbone(z)
-        img_512  = self.sr_512(img_256)
-        img_1024 = self.sr_1024(img_512)
-        return img_1024
-
-    # --- Phase-1 training forward (256 → 512) ---
-    def forward_phase1(self, z: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            img_256 = self.backbone(z)
-        return self.sr_512(img_256)
-
-    # --- Phase-2 training forward (256 → 512 → 1024) ---
-    def forward_phase2(self, z: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            img_256 = self.backbone(z)
-            img_512 = self.sr_512(img_256)
-        return self.sr_1024(img_512)
-
-    def freeze_backbone(self) -> None:
-        self.backbone.freeze()
-
-    def freeze_sr512(self) -> None:
-        self.sr_512.freeze()
-
-    @property
-    def phase1_parameters(self):
-        return self.sr_512.parameters()
-
-    @property
-    def phase2_parameters(self):
-        return self.sr_1024.parameters()
-
-
-# =============================================================================
-# Discriminator
-# =============================================================================
-
-class _ResBlockDown(nn.Module):
-    """Pre-activation downsample block (skip uses same activation as main)."""
 
     def __init__(self, in_ch: int, out_ch: int, use_sn: bool = True):
         super().__init__()
@@ -437,9 +193,13 @@ class _ResBlockDown(nn.Module):
         return (h + skip) / math.sqrt(2)
 
 
-class _DiscSelfAttn(nn.Module):
-    def __init__(self, channels: int, use_sn: bool = True):
+class SelfAttention2d(nn.Module):
+    """SAGAN-style self-attention with learnable gamma (init 0)."""
+
+    def __init__(self, channels: int, use_sn: bool = False):
         super().__init__()
+        if channels < 8:
+            raise ValueError(f"SelfAttention2d requires channels >= 8, got {channels}")
         wrap = sn if use_sn else (lambda m: m)
         cs   = max(1, channels // 8)
         cm   = max(1, channels // 2)
@@ -460,7 +220,7 @@ class _DiscSelfAttn(nn.Module):
         return self.gamma * self.o(y) + x
 
 
-class _MinibatchStd(nn.Module):
+class MinibatchStd(nn.Module):
     def __init__(self, group_size: int = 4):
         super().__init__()
         self.group_size = group_size
@@ -477,9 +237,215 @@ class _MinibatchStd(nn.Module):
         return torch.cat([x, y], dim=1)
 
 
-class Discriminator(nn.Module):
-    """Config-driven ResNet-D with SpectralNorm + optional SelfAttention."""
+# =============================================================================
+# Generator
+# =============================================================================
 
+class Generator(nn.Module):
+    """Residual progressive generator: z → 256 → (512) → (1024).
+
+    Stage storage:
+        res_blocks  : ModuleList  — one ResBlockUp per upsample stage
+        attn_blocks : ModuleDict  — SelfAttention2d keyed by resolution str
+
+    Residual RGB:
+        Base RGB head at the last non-residual resolution (e.g. 256).
+        Each residual_rgb_resolution adds:
+            out = clamp(upsample(prev_out) + fade_scale * residual_conv(feat))
+        residual_conv is zero-initialized → safe from step 0.
+    """
+
+    def __init__(self, cfg: GeneratorConfig):
+        super().__init__()
+        self.cfg   = cfg
+        self.z_dim = cfg.z_dim
+
+        first_res = cfg.resolutions[0]
+        first_ch  = cfg.channels[first_res]
+        self.first_res = first_res
+        self.first_ch  = first_ch
+
+        self.input_proj = nn.Linear(cfg.z_dim, first_ch * first_res * first_res)
+
+        self.res_blocks:  nn.ModuleList = nn.ModuleList()
+        self.attn_blocks: nn.ModuleDict = nn.ModuleDict()
+
+        for i in range(1, len(cfg.resolutions)):
+            in_ch   = cfg.channels[cfg.resolutions[i - 1]]
+            out_ch  = cfg.channels[cfg.resolutions[i]]
+            res_out = cfg.resolutions[i]
+            self.res_blocks.append(
+                ResBlockUp(in_ch, out_ch, norm_type=cfg.norm_type, gn_groups=cfg.gn_groups)
+            )
+            if res_out in cfg.attention_resolutions:
+                self.attn_blocks[str(res_out)] = SelfAttention2d(out_ch, use_sn=False)
+
+        # Base RGB head — at the last non-residual resolution
+        residual_set = set(cfg.residual_rgb_resolutions)
+        if residual_set:
+            first_res_idx        = min(cfg.resolutions.index(r) for r in residual_set)
+            self.base_rgb_res    = cfg.resolutions[first_res_idx - 1]
+        else:
+            self.base_rgb_res    = cfg.resolutions[-1]
+
+        base_ch       = cfg.channels[self.base_rgb_res]
+        self.out_norm = make_norm(base_ch, cfg.norm_type, cfg.gn_groups)
+        self.to_rgb   = nn.Conv2d(base_ch, 3, 3, padding=1)
+
+        # Residual RGB branches
+        self.residual_norms:   nn.ModuleDict = nn.ModuleDict()
+        self.residual_to_rgbs: nn.ModuleDict = nn.ModuleDict()
+
+        initial_fade = 1.0 if cfg.residual_rgb_fade_images == 0 else 0.0
+        self.register_buffer("_fade", torch.tensor(initial_fade), persistent=False)
+
+        for res in cfg.residual_rgb_resolutions:
+            key = str(res)
+            ch  = cfg.channels[res]
+            self.residual_norms[key]   = make_norm(ch, cfg.norm_type, cfg.gn_groups)
+            self.residual_to_rgbs[key] = nn.Conv2d(ch, 3, 3, padding=1)
+            nn.init.zeros_(self.residual_to_rgbs[key].weight)
+            nn.init.zeros_(self.residual_to_rgbs[key].bias)
+
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def set_training_progress(self, images_seen: int) -> None:
+        if self.cfg.residual_rgb_fade_images == 0:
+            fade = 1.0
+        else:
+            fade = min(1.0, images_seen / self.cfg.residual_rgb_fade_images)
+        self._fade.fill_(fade)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        h = self.input_proj(z).view(-1, self.first_ch, self.first_res, self.first_res)
+
+        image: Optional[torch.Tensor] = None
+        residual_set = set(self.cfg.residual_rgb_resolutions)
+
+        if self.first_res == self.base_rgb_res:
+            image = torch.tanh(self.to_rgb(F.relu(self.out_norm(h))))
+
+        for i, res_out in enumerate(self.cfg.resolutions[1:]):
+            h = self.res_blocks[i](h)
+            if str(res_out) in self.attn_blocks:
+                h = self.attn_blocks[str(res_out)](h)
+
+            if res_out == self.base_rgb_res:
+                image = torch.tanh(self.to_rgb(F.relu(self.out_norm(h))))
+
+            elif res_out in residual_set:
+                if image is None:
+                    raise RuntimeError(f"No base image before residual stage {res_out}")
+                image = F.interpolate(
+                    image, size=(res_out, res_out), mode="bilinear", align_corners=False
+                )
+                key      = str(res_out)
+                residual = self.residual_to_rgbs[key](F.relu(self.residual_norms[key](h)))
+                scale    = self.cfg.residual_rgb_scale * self._fade
+                image    = (image + scale * residual).clamp(-1.0, 1.0)
+
+        if image is None:
+            raise RuntimeError("Generator produced no image")
+        return image
+
+    def forward_with_aux(self, z: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Forward with residual L2 aux loss for regularization."""
+        h = self.input_proj(z).view(-1, self.first_ch, self.first_res, self.first_res)
+
+        image: Optional[torch.Tensor] = None
+        residual_set   = set(self.cfg.residual_rgb_resolutions)
+        residual_l2    = z.new_zeros(())
+        residual_count = 0
+
+        if self.first_res == self.base_rgb_res:
+            image = torch.tanh(self.to_rgb(F.relu(self.out_norm(h))))
+
+        for i, res_out in enumerate(self.cfg.resolutions[1:]):
+            h = self.res_blocks[i](h)
+            if str(res_out) in self.attn_blocks:
+                h = self.attn_blocks[str(res_out)](h)
+
+            if res_out == self.base_rgb_res:
+                image = torch.tanh(self.to_rgb(F.relu(self.out_norm(h))))
+
+            elif res_out in residual_set:
+                if image is None:
+                    raise RuntimeError(f"No base image before residual stage {res_out}")
+                image = F.interpolate(
+                    image, size=(res_out, res_out), mode="bilinear", align_corners=False
+                )
+                key      = str(res_out)
+                residual = self.residual_to_rgbs[key](F.relu(self.residual_norms[key](h)))
+                scale    = self.cfg.residual_rgb_scale * self._fade
+                image    = (image + scale * residual).clamp(-1.0, 1.0)
+                residual_l2    = residual_l2 + residual.square().mean()
+                residual_count += 1
+
+        if image is None:
+            raise RuntimeError("Generator produced no image")
+        if residual_count > 0:
+            residual_l2 = residual_l2 / residual_count
+        return image, {"residual_l2": residual_l2}
+
+    def freeze_backbone(self) -> None:
+        """Freeze all stages up to and including base_rgb_res."""
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+        # Unfreeze only residual stages and their RGB heads
+        for i, res_out in enumerate(self.cfg.resolutions[1:]):
+            if res_out in self.cfg.residual_rgb_resolutions:
+                for p in self.res_blocks[i].parameters():
+                    p.requires_grad_(True)
+                if str(res_out) in self.attn_blocks:
+                    for p in self.attn_blocks[str(res_out)].parameters():
+                        p.requires_grad_(True)
+                for p in self.residual_norms[str(res_out)].parameters():
+                    p.requires_grad_(True)
+                for p in self.residual_to_rgbs[str(res_out)].parameters():
+                    p.requires_grad_(True)
+
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total     = sum(p.numel() for p in self.parameters())
+        print(f"Generator freeze: trainable {trainable/1e6:.2f}M / {total/1e6:.2f}M params")
+
+    def freeze_up_to(self, freeze_resolutions: list[int]) -> None:
+        """Freeze stages up to and including given resolutions."""
+        freeze_set = set(freeze_resolutions)
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+        for i, res_out in enumerate(self.cfg.resolutions[1:]):
+            if res_out not in freeze_set:
+                for p in self.res_blocks[i].parameters():
+                    p.requires_grad_(True)
+                if str(res_out) in self.attn_blocks:
+                    for p in self.attn_blocks[str(res_out)].parameters():
+                        p.requires_grad_(True)
+            if res_out in self.cfg.residual_rgb_resolutions and res_out not in freeze_set:
+                for p in self.residual_norms[str(res_out)].parameters():
+                    p.requires_grad_(True)
+                for p in self.residual_to_rgbs[str(res_out)].parameters():
+                    p.requires_grad_(True)
+
+        # Base RGB head
+        if self.base_rgb_res not in freeze_set:
+            for p in self.out_norm.parameters():
+                p.requires_grad_(True)
+            for p in self.to_rgb.parameters():
+                p.requires_grad_(True)
+
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total     = sum(p.numel() for p in self.parameters())
+        print(f"Generator partial freeze: trainable {trainable/1e6:.2f}M / {total/1e6:.2f}M params")
+
+
+# =============================================================================
+# Discriminator
+# =============================================================================
+
+class Discriminator(nn.Module):
     def __init__(self, cfg: DiscriminatorConfig):
         super().__init__()
         self.cfg  = cfg
@@ -492,16 +458,18 @@ class Discriminator(nn.Module):
         self.attn_blocks: nn.ModuleDict = nn.ModuleDict()
 
         for i in range(1, len(cfg.resolutions)):
-            in_ch  = cfg.channels[cfg.resolutions[i - 1]]
-            out_ch = cfg.channels[cfg.resolutions[i]]
+            in_ch   = cfg.channels[cfg.resolutions[i - 1]]
+            out_ch  = cfg.channels[cfg.resolutions[i]]
             res_out = cfg.resolutions[i]
-            self.res_blocks.append(_ResBlockDown(in_ch, out_ch, cfg.use_spectral_norm))
+            self.res_blocks.append(ResBlockDown(in_ch, out_ch, use_sn=cfg.use_spectral_norm))
             if res_out in cfg.attention_resolutions:
-                self.attn_blocks[str(res_out)] = _DiscSelfAttn(out_ch, cfg.use_spectral_norm)
+                self.attn_blocks[str(res_out)] = SelfAttention2d(
+                    out_ch, use_sn=cfg.use_spectral_norm
+                )
 
         last_res          = cfg.resolutions[-1]
         last_ch           = cfg.channels[last_res]
-        self.minibatch_std = _MinibatchStd(cfg.minibatch_std_group)
+        self.minibatch_std = MinibatchStd(cfg.minibatch_std_group)
         self.final_conv    = wrap(nn.Conv2d(last_ch + 1, last_ch, 3, padding=1))
         self.final_linear  = wrap(nn.Linear(last_ch * last_res * last_res, 1))
 
@@ -517,83 +485,32 @@ class Discriminator(nn.Module):
 
 
 # =============================================================================
-# PatchDiscriminator  (70×70 PatchGAN)
-# =============================================================================
-
-class PatchDiscriminator(nn.Module):
-    """70×70 PatchGAN discriminator.
-
-    Output shape: (B, 1, H', W') where each value covers a 70×70 receptive field.
-    Loss is computed as mean over all patch predictions.
-
-    Why better than full-image D for SR:
-    - Focuses on local texture (blur vs sharp), not global structure
-    - Generated images have right structure (backbone) but wrong texture — patches catch this
-    - More stable gradient signal at high resolution
-
-    Architecture: C64 → C128 → C256 → C512 → C1
-    (stride-2 for first n_layers, stride-1 for last two)
-    """
-
-    def __init__(self, in_ch: int = 3, base_ch: int = 64, n_layers: int = 3,
-                 use_spectral_norm: bool = True):
-        super().__init__()
-        wrap = sn if use_spectral_norm else (lambda m: m)
-
-        layers: list[nn.Module] = []
-        ch_in  = in_ch
-        ch_out = base_ch
-
-        # Strided conv layers (downsampling)
-        for i in range(n_layers):
-            layers += [
-                wrap(nn.Conv2d(ch_in, ch_out, kernel_size=4, stride=2, padding=1)),
-                nn.LeakyReLU(0.2),
-            ]
-            ch_in  = ch_out
-            ch_out = min(ch_out * 2, 512)
-
-        # stride-1 layer before output
-        layers += [
-            wrap(nn.Conv2d(ch_in, ch_out, kernel_size=4, stride=1, padding=1)),
-            nn.LeakyReLU(0.2),
-        ]
-        # Output: 1 channel patch map
-        layers += [wrap(nn.Conv2d(ch_out, 1, kernel_size=4, stride=1, padding=1))]
-
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)   # (B, 1, H', W') — averaged in loss
-
-
-# =============================================================================
-# EMA  (tracks the active refiner only)
+# EMA
 # =============================================================================
 
 class EMA:
-    """EMA of a single SRRefiner module.
+    """Exponential moving average of Generator weights."""
 
-    Phase 1: EMA(G.sr_512)
-    Phase 2: EMA(G.sr_1024)
-    """
-
-    def __init__(self, module: nn.Module, half_life: int = 10_000):
-        self.shadow = copy.deepcopy(module).eval()
+    def __init__(self, G: nn.Module, half_life: int = 10_000):
+        self.shadow = copy.deepcopy(G).eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
         self.half_life = half_life
 
     @torch.no_grad()
-    def update(self, module: nn.Module, batch_size: int) -> None:
+    def update(self, G: nn.Module, batch_size: int) -> None:
         decay = 0.5 ** (batch_size / self.half_life)
         s_params = list(self.shadow.parameters())
-        l_params = list(module.parameters())
+        l_params = list(G.parameters())
         if len(s_params) != len(l_params):
-            raise RuntimeError("EMA: parameter count mismatch")
+            raise RuntimeError("EMA param count mismatch")
         for sp, p in zip(s_params, l_params):
             sp.mul_(decay).add_(p.detach(), alpha=1.0 - decay)
-        for sb, b in zip(self.shadow.buffers(), module.buffers()):
+        s_bufs = list(self.shadow.buffers())
+        l_bufs = list(G.buffers())
+        if len(s_bufs) != len(l_bufs):
+            raise RuntimeError("EMA buffer count mismatch")
+        for sb, b in zip(s_bufs, l_bufs):
             sb.copy_(b)
 
     def state_dict(self) -> dict:
@@ -607,45 +524,52 @@ class EMA:
 # Factory configs
 # =============================================================================
 
-BACKBONE_256_CONFIG = BackboneConfig(
+BACKBONE_CHANNELS = {4: 512, 8: 512, 16: 512, 32: 512, 64: 256, 128: 128, 256: 64}
+
+# Phase 1: 512 output via residual branch
+GENERATOR_512_CONFIG = GeneratorConfig(
     z_dim=512,
-    resolutions=[4, 8, 16, 32, 64, 128, 256],
-    channels={4: 512, 8: 512, 16: 512, 32: 512, 64: 256, 128: 128, 256: 64},
-    norm_type="gn",
-    gn_groups=32,
+    resolutions=[4, 8, 16, 32, 64, 128, 256, 512],
+    channels={**BACKBONE_CHANNELS, 512: 64},
+    norm_type="gn", gn_groups=32,
     attention_resolutions=[32],
-)
-
-SR_512_CONFIG = SRRefinerConfig(
-    in_resolution=256, out_resolution=512,
-    mid_ch=64, n_res_blocks=8, n_mid_blocks=4,
-)
-
-SR_1024_CONFIG = SRRefinerConfig(
-    in_resolution=512, out_resolution=1024,
-    mid_ch=64, n_res_blocks=8, n_mid_blocks=4,
+    residual_rgb_resolutions=[512],
+    residual_rgb_scale=0.03,
+    residual_rgb_fade_images=20_000,
 )
 
 DISCRIMINATOR_512_CONFIG = DiscriminatorConfig(
     resolutions=[512, 256, 128, 64, 32, 16, 8, 4],
     channels={512: 64, 256: 64, 128: 128, 64: 256, 32: 512, 16: 512, 8: 512, 4: 512},
-    use_spectral_norm=True,
-    minibatch_std_group=4,
+    use_spectral_norm=True, minibatch_std_group=4, attention_resolutions=[32],
+)
+
+# Phase 2: 1024 output via additional residual branch
+GENERATOR_1024_CONFIG = GeneratorConfig(
+    z_dim=512,
+    resolutions=[4, 8, 16, 32, 64, 128, 256, 512, 1024],
+    channels={**BACKBONE_CHANNELS, 512: 64, 1024: 32},
+    norm_type="gn", gn_groups=32,
     attention_resolutions=[32],
+    residual_rgb_resolutions=[512, 1024],
+    residual_rgb_scale=0.03,
+    residual_rgb_fade_images=0,  # 512 already faded; 1024 head is zero-init
 )
 
 DISCRIMINATOR_1024_CONFIG = DiscriminatorConfig(
     resolutions=[1024, 512, 256, 128, 64, 32, 16, 8, 4],
     channels={1024: 32, 512: 64, 256: 64, 128: 128,
               64: 256, 32: 512, 16: 512, 8: 512, 4: 512},
-    use_spectral_norm=True,
-    minibatch_std_group=4,
-    attention_resolutions=[32],
+    use_spectral_norm=True, minibatch_std_group=4, attention_resolutions=[32],
 )
 
 
-def build_generator() -> Generator:
-    return Generator(BACKBONE_256_CONFIG, SR_512_CONFIG, SR_1024_CONFIG)
+def build_generator_512() -> Generator:
+    return Generator(GENERATOR_512_CONFIG)
+
+
+def build_generator_1024() -> Generator:
+    return Generator(GENERATOR_1024_CONFIG)
 
 
 def build_discriminator_512() -> Discriminator:
@@ -656,41 +580,19 @@ def build_discriminator_1024() -> Discriminator:
     return Discriminator(DISCRIMINATOR_1024_CONFIG)
 
 
-def build_patch_discriminator(use_spectral_norm: bool = True) -> PatchDiscriminator:
-    return PatchDiscriminator(in_ch=3, base_ch=64, n_layers=3,
-                              use_spectral_norm=use_spectral_norm)
-
-
 # =============================================================================
 # Sanity check
 # =============================================================================
 
 if __name__ == "__main__":
-    G  = build_generator()
-    D1 = build_discriminator_512()
-    D2 = build_discriminator_1024()
-
-    n_bb   = sum(p.numel() for p in G.backbone.parameters())
-    n_sr512  = sum(p.numel() for p in G.sr_512.parameters())
-    n_sr1024 = sum(p.numel() for p in G.sr_1024.parameters())
-    n_total  = n_bb + n_sr512 + n_sr1024
-
-    print(f"BackboneGenerator : {n_bb/1e6:.2f}M")
-    print(f"SRRefiner_512     : {n_sr512/1e6:.2f}M")
-    print(f"SRRefiner_1024    : {n_sr1024/1e6:.2f}M")
-    print(f"Generator total   : {n_total/1e6:.2f}M  {'OK (<40M)' if n_total < 40e6 else 'FAIL'}")
-    print(f"Discriminator_512 : {sum(p.numel() for p in D1.parameters())/1e6:.2f}M")
-    print(f"Discriminator_1024: {sum(p.numel() for p in D2.parameters())/1e6:.2f}M")
-
-    z = torch.randn(2, G.z_dim)
-    G.freeze_backbone()
-
-    out512  = G.forward_phase1(z)
-    out1024 = G.forward_phase2(z)
-    full    = G(z)
-
-    print(f"\nPhase-1 output : {tuple(out512.shape)}")
-    print(f"Phase-2 output : {tuple(out1024.shape)}")
-    print(f"Inference      : {tuple(full.shape)}")
-    print(f"Backbone frozen: {all(not p.requires_grad for p in G.backbone.parameters())}")
-    print(f"SR_512  frozen : {all(not p.requires_grad for p in G.sr_512.parameters())}")
+    for label, G, D in [
+        ("Phase 1 (512)", build_generator_512(), build_discriminator_512()),
+        ("Phase 2 (1024)", build_generator_1024(), build_discriminator_1024()),
+    ]:
+        n_g = sum(p.numel() for p in G.parameters())
+        n_d = sum(p.numel() for p in D.parameters())
+        ok  = "OK" if n_g < 40e6 else "FAIL >40M"
+        z   = torch.randn(2, G.z_dim)
+        out = G(z)
+        D(out)
+        print(f"[{label}] G={n_g/1e6:.2f}M ({ok})  D={n_d/1e6:.2f}M  out={tuple(out.shape)}")

@@ -1,23 +1,19 @@
-"""Cascade SR-Refiner GAN training script.
+"""Residual Progressive GAN training script.
 
-Two training phases
--------------------
-Phase 1 — 256 → 512
+Phase 1 — 512 residual  (backbone frozen, 512 stage + residual head trained)
   python train.py --phase 1 \\
-    --config configs/phase1_sr512.yaml \\
-    --backbone-ckpt /content/drive/MyDrive/project2/ckpt/ffhq256_baseline.pt
+    --config configs/phase1_residual512.yaml \\
+    --init-from ckpt/ffhq256_baseline.pt
 
-Phase 2 — 512 → 1024
+Phase 2 — 1024 residual  (backbone + 512 frozen, 1024 stage trained)
   python train.py --phase 2 \\
-    --config configs/phase2_sr1024.yaml \\
-    --backbone-ckpt /content/drive/MyDrive/project2/ckpt/ffhq256_baseline.pt \\
-    --sr512-ckpt    /content/drive/MyDrive/project2claude/runs/phase1_sr512/final.pt
+    --config configs/phase2_residual1024.yaml \\
+    --init-from runs/phase1_residual512/final.pt
 
-Resume any interrupted run:
+Resume:
   python train.py --phase 1 \\
-    --config configs/phase1_sr512.yaml \\
-    --backbone-ckpt ... \\
-    --resume /content/drive/MyDrive/project2claude/runs/phase1_sr512/ckpt_000050000.pt
+    --config configs/phase1_residual512.yaml \\
+    --resume runs/phase1_residual512/ckpt_000050000.pt
 """
 from __future__ import annotations
 
@@ -46,16 +42,8 @@ except ImportError:
 
 from src.augment import diff_augment
 from src.dataset import ZipImageDataset, infinite_loader
-from src.losses import ns_logistic_g, ragan_d, ragan_g, r1_penalty
-from src.model import (
-    BackboneConfig,
-    SRRefinerConfig,
-    DiscriminatorConfig,
-    Generator,
-    Discriminator,
-    PatchDiscriminator,
-    EMA,
-)
+from src.losses import ns_logistic_g, r1_penalty
+from src.model import Generator, GeneratorConfig, Discriminator, DiscriminatorConfig, EMA
 
 
 # =============================================================================
@@ -122,31 +110,21 @@ def wait_for_saves(threads: list[_SaveThread]) -> None:
 
 
 def build_checkpoint(
-    *,
-    phase: int,
-    images_seen: int,
-    step: int,
-    G: Generator,
-    D: Discriminator,
-    ema: EMA,
-    optG: torch.optim.Optimizer,
-    optD: torch.optim.Optimizer,
-    cfg_dict: dict,
-    wandb_run_id: str | None,
+    *, phase: int, images_seen: int, step: int,
+    G: Generator, D: Discriminator, G_ema: EMA,
+    optG: torch.optim.Optimizer, optD: torch.optim.Optimizer,
+    g_cfg: GeneratorConfig, d_cfg: DiscriminatorConfig,
+    training_cfg: dict, wandb_run_id: str | None,
 ) -> dict:
-    # Save only the refiner being trained (backbone is always reloaded separately)
-    active_refiner_state = (
-        G.sr_512.state_dict() if phase == 1 else G.sr_1024.state_dict()
-    )
     state = {
-        "phase":              phase,
-        "images_seen":        images_seen,
-        "step":               step,
-        "active_refiner_state": active_refiner_state,
-        "ema_state":          ema.state_dict(),
-        "D_state":            D.state_dict(),
-        "optG_state":         optG.state_dict(),
-        "optD_state":         optD.state_dict(),
+        "phase":       phase,
+        "images_seen": images_seen,
+        "step":        step,
+        "G_state":     G.state_dict(),
+        "D_state":     D.state_dict(),
+        "G_ema_state": G_ema.state_dict(),
+        "optG_state":  optG.state_dict(),
+        "optD_state":  optD.state_dict(),
         "rng_state": {
             "torch":  torch.get_rng_state(),
             "cuda":   torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -154,38 +132,71 @@ def build_checkpoint(
             "python": random.getstate(),
         },
         "wandb_run_id": wandb_run_id,
-        "meta":         cfg_dict,
+        "meta": {
+            "generator_config":     asdict(g_cfg),
+            "discriminator_config": asdict(d_cfg),
+            "training_config":      training_cfg,
+        },
     }
     return snapshot_for_save(state)
 
 
 @torch.no_grad()
 def save_sample_grid(
-    G: Generator,
-    ema: EMA,
-    phase: int,
-    sample_z: torch.Tensor,
-    out_path: Path,
-    nrow: int = 4,
+    G_ema: EMA, sample_z: torch.Tensor, out_path: Path, nrow: int = 8
 ) -> None:
-    """Swap in EMA weights, generate samples, restore training weights."""
-    active = G.sr_512 if phase == 1 else G.sr_1024
-    original = copy.deepcopy(active.state_dict())
-    active.load_state_dict(ema.state_dict())
-
-    was_training = G.training
-    G.eval()
-    forward_fn = G.forward_phase1 if phase == 1 else G.forward_phase2
-    fake = forward_fn(sample_z)
+    was_training = G_ema.shadow.training
+    G_ema.shadow.eval()
+    fake = G_ema.shadow(sample_z)
     x    = ((fake + 1.0) / 2.0).clamp(0.0, 1.0)
     vutils.save_image(vutils.make_grid(x, nrow=nrow, padding=2), out_path)
+    G_ema.shadow.train(was_training)
 
-    active.load_state_dict(original)
-    G.train()
-    G.backbone.eval()
-    if phase == 2:
-        G.sr_512.eval()
-    G.train(was_training)
+
+# =============================================================================
+# Checkpoint loading
+# =============================================================================
+
+def init_from_checkpoint(
+    init_path: Path, G: Generator, D: Discriminator, G_ema: EMA, device: str
+) -> None:
+    """Partial-match load: copy tensors whose name AND shape agree."""
+
+    def _is_exact(module: nn.Module, source: dict) -> bool:
+        target = module.state_dict()
+        return (
+            len(target) == len(source)
+            and all(k in source and source[k].shape == v.shape for k, v in target.items())
+        )
+
+    def _load_partial(module: nn.Module, source: dict, label: str) -> None:
+        target  = module.state_dict()
+        matched = {k: v for k, v in source.items() if k in target and target[k].shape == v.shape}
+        target.update(matched)
+        module.load_state_dict(target)
+        print(f"  {label}: {len(matched)}/{len(source)} tensors matched")
+
+    import torch.nn as nn
+    print(f"Loading weights from: {init_path}")
+    ckpt = torch.load(init_path, map_location=device, weights_only=False)
+
+    g_state     = ckpt["G_state"]
+    g_ema_state = ckpt.get("G_ema_state", g_state)
+    d_state     = ckpt["D_state"]
+
+    if _is_exact(G, g_state):
+        G.load_state_dict(g_state)
+        G_ema.load_state_dict(g_ema_state)
+        print("  G, G_ema: exact match")
+    else:
+        _load_partial(G,           g_state,     "G     (partial)")
+        _load_partial(G_ema.shadow, g_ema_state, "G_ema (partial)")
+
+    if _is_exact(D, d_state):
+        D.load_state_dict(d_state)
+        print("  D: exact match")
+    else:
+        print("  D: architecture changed — random init")
 
 
 # =============================================================================
@@ -194,22 +205,19 @@ def save_sample_grid(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phase",         required=True, type=int, choices=[1, 2])
-    parser.add_argument("--config",        required=True, type=Path)
-    parser.add_argument("--backbone-ckpt", required=True, type=Path,
-                        help="Path to 256 baseline checkpoint.")
-    parser.add_argument("--sr512-ckpt",    type=Path, default=None,
-                        help="[Phase 2 only] checkpoint from Phase 1 (contains sr_512 weights).")
-    parser.add_argument("--resume",        type=Path, default=None,
-                        help="Resume from a checkpoint saved by this script.")
-    parser.add_argument("--total-images",  type=int,  default=None)
+    parser.add_argument("--phase",        required=True, type=int, choices=[1, 2])
+    parser.add_argument("--config",       required=True, type=Path)
+    parser.add_argument("--init-from",    type=Path, default=None,
+                        help="Partial-load weights (optimizers reset).")
+    parser.add_argument("--resume",       type=Path, default=None,
+                        help="Full resume: G/D/G_ema/optimizers/RNG.")
+    parser.add_argument("--total-images", type=int, default=None)
     parser.add_argument("--new-wandb-run", action="store_true")
     args = parser.parse_args()
 
-    if args.phase == 2 and args.sr512_ckpt is None and args.resume is None:
-        raise SystemExit("Phase 2 requires --sr512-ckpt (or --resume).")
+    if args.init_from and args.resume:
+        raise SystemExit("Use --init-from or --resume, not both.")
 
-    # --- Config ---
     cfg       = load_config(args.config)
     train_cfg = cfg["training"]
     if args.total_images is not None:
@@ -220,117 +228,69 @@ def main() -> None:
     torch.backends.cudnn.benchmark = True
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # --- Build model ---
-    backbone_cfg    = BackboneConfig.from_dict(cfg["backbone"])
-    refiner512_cfg  = SRRefinerConfig.from_dict(cfg["refiner_512"])
-    refiner1024_cfg = SRRefinerConfig.from_dict(cfg["refiner_1024"])
+    g_cfg = GeneratorConfig.from_dict(cfg["generator"])
+    d_cfg = DiscriminatorConfig.from_dict(cfg["discriminator"])
 
-    G = Generator(backbone_cfg, refiner512_cfg, refiner1024_cfg).to(device)
+    resolution = int(train_cfg["resolution"])
+    if g_cfg.resolutions[-1] != resolution or d_cfg.resolutions[0] != resolution:
+        raise ValueError(
+            f"training.resolution={resolution} must match G output "
+            f"({g_cfg.resolutions[-1]}) and D input ({d_cfg.resolutions[0]})"
+        )
 
-    # Discriminator: 'patch' or 'full'
-    disc_type = cfg.get("discriminator", {}).get("type", "full")
-    if disc_type == "patch":
-        use_sn = cfg["discriminator"].get("use_spectral_norm", True)
-        D = PatchDiscriminator(use_spectral_norm=use_sn).to(device)
-        d_cfg = None
-        print("Discriminator: PatchGAN (70x70)")
-    else:
-        d_cfg = DiscriminatorConfig.from_dict(cfg["discriminator"])
-        D = Discriminator(d_cfg).to(device)
-        print("Discriminator: Full-image ResNet-D")
+    G     = Generator(g_cfg).to(device)
+    D     = Discriminator(d_cfg).to(device)
+    G_ema = EMA(G, half_life=train_cfg["ema_half_life"])
+    G_ema.shadow.to(device)
 
-    # Load & freeze backbone
-    G.backbone.load_from_baseline(str(args.backbone_ckpt), device=device)
-    G.freeze_backbone()
+    n_g = sum(p.numel() for p in G.parameters())
+    n_d = sum(p.numel() for p in D.parameters())
+    print(f"Generator:     {n_g/1e6:.2f}M params")
+    print(f"Discriminator: {n_d/1e6:.2f}M params")
+    if n_g > 40e6:
+        raise ValueError(f"Generator {n_g/1e6:.2f}M exceeds 40M limit!")
 
-    # Phase 2: load sr_512 weights and freeze
-    if args.phase == 2 and args.sr512_ckpt is not None:
-        print(f"Loading SR_512 weights from: {args.sr512_ckpt}")
-        sr_ckpt = torch.load(args.sr512_ckpt, map_location=device, weights_only=False)
-        # Accept both "active_refiner_state" (our format) or "sr_512_state"
-        sr_state = sr_ckpt.get("active_refiner_state", sr_ckpt.get("sr_512_state"))
-        if sr_state is None:
-            raise KeyError("sr512 checkpoint has no 'active_refiner_state' key")
-        G.sr_512.load_state_dict(sr_state)
-        print("  SR_512 loaded OK")
-    if args.phase == 2:
-        G.freeze_sr512()
+    lr_g = float(train_cfg.get("lr_g", train_cfg.get("lr", 1e-3)))
+    lr_d = float(train_cfg.get("lr_d", train_cfg.get("lr", 1e-3)))
+    beta1, beta2 = train_cfg["beta1"], train_cfg["beta2"]
+    wd = train_cfg.get("weight_decay", 0.0)
 
-    # Active refiner & EMA
-    active_refiner = G.sr_512 if args.phase == 1 else G.sr_1024
-    ema = EMA(active_refiner, half_life=train_cfg["ema_half_life"])
-
-    # Print param counts
-    n_bb    = sum(p.numel() for p in G.backbone.parameters())
-    n_sr512 = sum(p.numel() for p in G.sr_512.parameters())
-    n_sr1024= sum(p.numel() for p in G.sr_1024.parameters())
-    n_total = n_bb + n_sr512 + n_sr1024
-    n_d     = sum(p.numel() for p in D.parameters())
-    print(f"BackboneGenerator : {n_bb/1e6:.2f}M  (frozen)")
-    print(f"SRRefiner_512     : {n_sr512/1e6:.2f}M  {'(frozen)' if args.phase == 2 else '(trainable)'}")
-    print(f"SRRefiner_1024    : {n_sr1024/1e6:.2f}M  {'(trainable)' if args.phase == 2 else '(unused)'}")
-    print(f"Generator total   : {n_total/1e6:.2f}M")
-    print(f"Discriminator     : {n_d/1e6:.2f}M")
-    if n_total > 40e6:
-        raise ValueError(f"Generator {n_total/1e6:.2f}M exceeds 40M limit!")
-
-    # Loss type
-    loss_type = train_cfg.get("loss_type", "ns_logistic")
-    print(f"Loss type: {loss_type}")
-
-    # --- Optimizers ---
-    lr_g = float(train_cfg.get("lr_g", train_cfg.get("lr", 2e-4)))
-    lr_d = float(train_cfg.get("lr_d", train_cfg.get("lr", 2e-4)))
-    optG = torch.optim.Adam(
-        active_refiner.parameters(), lr=lr_g,
-        betas=(train_cfg["beta1"], train_cfg["beta2"]), eps=1e-8,
-        weight_decay=train_cfg.get("weight_decay", 0.0),
-    )
-    optD = torch.optim.Adam(
-        D.parameters(), lr=lr_d,
-        betas=(train_cfg["beta1"], train_cfg["beta2"]), eps=1e-8,
-        weight_decay=train_cfg.get("weight_decay", 0.0),
-    )
+    optG = torch.optim.Adam(G.parameters(), lr=lr_g, betas=(beta1, beta2), eps=1e-8, weight_decay=wd)
+    optD = torch.optim.Adam(D.parameters(), lr=lr_d, betas=(beta1, beta2), eps=1e-8, weight_decay=wd)
     print(f"Optimizers: lr_g={lr_g}, lr_d={lr_d}")
 
-    # --- Dataset ---
     dataset     = ZipImageDataset(train_cfg["train_zip"], flip=train_cfg.get("flip", True))
-    print(f"Dataset: {len(dataset)} images")
     num_workers = train_cfg.get("num_workers", 4)
+    print(f"Dataset: {len(dataset)} images")
     loader = DataLoader(
-        dataset,
-        batch_size=train_cfg["batch_size"],
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=(device == "cuda"),
+        dataset, batch_size=train_cfg["batch_size"], shuffle=True,
+        num_workers=num_workers, pin_memory=(device == "cuda"),
         persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
-        drop_last=True,
+        prefetch_factor=2 if num_workers > 0 else None, drop_last=True,
     )
     inf_loader = infinite_loader(loader)
-    resolution = int(train_cfg["resolution"])
 
     sample_gen = torch.Generator(device="cpu").manual_seed(train_cfg["sample_seed"])
-    sample_z   = torch.randn(
-        train_cfg["sample_n"], backbone_cfg.z_dim, generator=sample_gen
-    ).to(device)
+    sample_z   = torch.randn(train_cfg["sample_n"], g_cfg.z_dim, generator=sample_gen).to(device)
 
     run_dir     = Path(cfg["out"]["run_dir"])
     samples_dir = run_dir / "samples"
     run_dir.mkdir(parents=True, exist_ok=True)
     samples_dir.mkdir(exist_ok=True)
 
-    # --- Init / resume ---
     images_seen  = 0
     step         = 0
     wandb_run_id: str | None = None
 
-    if args.resume is not None:
+    if args.init_from:
+        init_from_checkpoint(args.init_from, G, D, G_ema, device=device)
+
+    if args.resume:
         print(f"Resuming from {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        active_refiner.load_state_dict(ckpt["active_refiner_state"])
-        ema.load_state_dict(ckpt["ema_state"])
+        G.load_state_dict(ckpt["G_state"])
         D.load_state_dict(ckpt["D_state"])
+        G_ema.load_state_dict(ckpt["G_ema_state"])
         if "optG_state" in ckpt:
             optG.load_state_dict(ckpt["optG_state"])
         if "optD_state" in ckpt:
@@ -345,14 +305,28 @@ def main() -> None:
         rng = ckpt.get("rng_state", {})
         if rng.get("torch") is not None:
             torch.set_rng_state(rng["torch"].cpu())
-        if torch.cuda.is_available() and rng.get("cuda") is not None:
+        if torch.cuda.is_available() and rng.get("cuda"):
             torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
-        if rng.get("numpy") is not None:
+        if rng.get("numpy"):
             np.random.set_state(rng["numpy"])
-        if rng.get("python") is not None:
+        if rng.get("python"):
             random.setstate(rng["python"])
 
-    # --- W&B ---
+    # Apply freeze based on phase
+    freeze_cfg = train_cfg.get("freeze_resolutions", [])
+    if freeze_cfg:
+        G.freeze_up_to([int(r) for r in freeze_cfg])
+    elif train_cfg.get("freeze_backbone", False):
+        G.freeze_backbone()
+
+    # Rebuild optimizer with only trainable params
+    if any(train_cfg.get(k) for k in ("freeze_backbone", "freeze_resolutions")):
+        optG = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, G.parameters()),
+            lr=lr_g, betas=(beta1, beta2), eps=1e-8, weight_decay=wd,
+        )
+
+    # W&B
     wandb_cfg  = cfg.get("wandb", {})
     wandb_mode = wandb_cfg.get("mode", "disabled") if _HAS_WANDB else "disabled"
     run        = None
@@ -361,9 +335,7 @@ def main() -> None:
             api_key = os.environ.get(wandb_cfg.get("api_key_env", "WANDB_API_KEY"), "")
             if api_key:
                 wandb.login(key=api_key, relogin=False)
-                print("wandb: logged in via env var")
             else:
-                print("wandb: no API key — prompting for login")
                 wandb.login()
         init_kw: dict = {
             "project": wandb_cfg.get("project", "ffhqgen-student"),
@@ -373,29 +345,28 @@ def main() -> None:
         }
         if wandb_cfg.get("entity"):
             init_kw["entity"] = wandb_cfg["entity"]
-        if wandb_run_id is not None:
+        if wandb_run_id:
             init_kw["id"]     = wandb_run_id
             init_kw["resume"] = "must"
         run          = wandb.init(**init_kw)
         wandb_run_id = run.id
 
-    # --- Hyper-params ---
-    total_images   = train_cfg["total_images"]
-    z_dim          = backbone_cfg.z_dim
-    r1_gamma       = train_cfg["r1_gamma"]
-    r1_lazy_every  = train_cfg["r1_lazy_every"]
-    log_every      = train_cfg["log_every"]
-    ckpt_every     = train_cfg["ckpt_every"]
-    grad_clip_g    = float(train_cfg.get("grad_clip_g", float("inf")))
-    grad_clip_d    = float(train_cfg.get("grad_clip_d", float("inf")))
-    augment_policy = train_cfg.get("augment", "") or ""
-    precision      = train_cfg.get("precision", "fp32")
-    use_amp        = (precision == "bf16")
-    amp_dtype      = torch.bfloat16 if use_amp else torch.float32
-
-    forward_fn = G.forward_phase1 if args.phase == 1 else G.forward_phase2
+    total_images          = train_cfg["total_images"]
+    z_dim                 = g_cfg.z_dim
+    r1_gamma              = train_cfg["r1_gamma"]
+    r1_lazy_every         = train_cfg["r1_lazy_every"]
+    log_every             = train_cfg["log_every"]
+    ckpt_every            = train_cfg["ckpt_every"]
+    grad_clip_g           = float(train_cfg.get("grad_clip_g", float("inf")))
+    grad_clip_d           = float(train_cfg.get("grad_clip_d", float("inf")))
+    residual_l2_weight    = float(train_cfg.get("residual_rgb_l2_weight", 0.0))
+    augment_policy        = train_cfg.get("augment", "") or ""
+    precision             = train_cfg.get("precision", "fp32")
+    use_amp               = (precision == "bf16")
+    amp_dtype             = torch.bfloat16 if use_amp else torch.float32
 
     print(f"Phase {args.phase} | resolution={resolution} | augment={augment_policy!r}")
+    print(f"residual_rgb_l2_weight={residual_l2_weight}")
     print(f"Training: {images_seen} -> {total_images} (batch={train_cfg['batch_size']}, device={device})")
 
     last_ckpt     = images_seen
@@ -406,39 +377,26 @@ def main() -> None:
 
     # =========================================================================
     G.train()
-    G.backbone.eval()
-    if args.phase == 2:
-        G.sr_512.eval()
 
     while images_seen < total_images:
+        G.set_training_progress(images_seen)
+
         real = next(inf_loader).to(device, non_blocking=True)
         b    = real.size(0)
 
         if real.shape[-2:] != (resolution, resolution):
-            raise ValueError(
-                f"Dataset images must be {resolution}x{resolution}, "
-                f"got {tuple(real.shape[-2:])}."
-            )
+            raise ValueError(f"Dataset must be {resolution}x{resolution}, got {tuple(real.shape[-2:])}")
 
         # --- D step ---
         z = torch.randn(b, z_dim, device=device)
         with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-            fake   = forward_fn(z)
-            d_real = D(diff_augment(real, augment_policy))
-            d_fake = D(diff_augment(fake.detach(), augment_policy))
-            if loss_type == "ragan":
-                l_d      = ragan_d(d_real, d_fake)
-                l_d_real = F.binary_cross_entropy_with_logits(
-                    d_real - d_fake.mean(), torch.ones_like(d_real))
-                l_d_fake = F.binary_cross_entropy_with_logits(
-                    d_fake - d_real.mean(), torch.zeros_like(d_fake))
-            else:
-                l_d_real = F.softplus(-d_real).mean()
-                l_d_fake = F.softplus(d_fake).mean()
-                l_d      = l_d_real + l_d_fake
-
-        # save d_real for G step (RaGAN needs it)
-        d_real_detached = d_real.detach()
+            with torch.no_grad():
+                fake = G(z)
+            d_real   = D(diff_augment(real, augment_policy))
+            d_fake   = D(diff_augment(fake.detach(), augment_policy))
+            l_d_real = F.softplus(-d_real).mean()
+            l_d_fake = F.softplus(d_fake).mean()
+            l_d      = l_d_real + l_d_fake
 
         optD.zero_grad(set_to_none=True)
         l_d.backward()
@@ -450,34 +408,32 @@ def main() -> None:
             l_r1.backward()
             last_r1_value = float(l_r1.item()) / r1_lazy_every
 
-        grad_norm_d = float(
-            torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=grad_clip_d)
-        )
+        grad_norm_d = float(torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=grad_clip_d))
         optD.step()
 
-        # --- G (active refiner) step ---
+        # --- G step ---
         z = torch.randn(b, z_dim, device=device)
         with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-            fake_g   = forward_fn(z)
-            d_fake_g = D(diff_augment(fake_g, augment_policy))
-            if loss_type == "ragan":
-                l_g = ragan_g(d_real_detached, d_fake_g)
-            else:
-                l_g = ns_logistic_g(d_fake_g)
+            fake, g_aux  = G.forward_with_aux(z)
+            l_g_residual = g_aux["residual_l2"]
+            d_fake_g     = D(diff_augment(fake, augment_policy))
+            l_g_adv      = ns_logistic_g(d_fake_g)
+            l_g          = l_g_adv + residual_l2_weight * l_g_residual
 
         optG.zero_grad(set_to_none=True)
         l_g.backward()
         grad_norm_g = float(
-            torch.nn.utils.clip_grad_norm_(active_refiner.parameters(), max_norm=grad_clip_g)
+            torch.nn.utils.clip_grad_norm_(
+                filter(lambda p: p.requires_grad, G.parameters()), max_norm=grad_clip_g
+            )
         )
         optG.step()
-        ema.update(active_refiner, b)
+        G_ema.update(G, b)
 
         images_seen += b
         window_imgs += b
         step        += 1
 
-        # --- Logging ---
         if step % log_every == 0:
             now        = time.perf_counter()
             elapsed    = max(now - window_t0, 1e-6)
@@ -492,6 +448,10 @@ def main() -> None:
                 "loss/D_real":             float(l_d_real.item()),
                 "loss/D_fake":             float(l_d_fake.item()),
                 "loss/G":                  float(l_g.item()),
+                "loss/G_adv":              float(l_g_adv.item()),
+                "loss/G_residual_l2":      float(l_g_residual.item()),
+                "residual_rgb/rms":        float(l_g_residual.sqrt().item()),
+                "residual_rgb/fade":       float(G._fade.item()),
                 "D_out/real_mean":         float(d_real.float().mean().item()),
                 "D_out/fake_mean":         float(d_fake.float().mean().item()),
                 "grad_norm/G":             grad_norm_g,
@@ -500,7 +460,6 @@ def main() -> None:
             }
             if last_r1_value is not None:
                 log["loss/R1"] = last_r1_value
-
             if wandb_mode != "disabled":
                 wandb.log(log, step=step)
             else:
@@ -508,34 +467,35 @@ def main() -> None:
                     f"[P{args.phase}] step={step} imgs={images_seen} "
                     f"thr={throughput:.0f}img/s "
                     f"l_d={l_d.item():.3f} l_g={l_g.item():.3f} "
-                    f"gn_g={grad_norm_g:.2f} gn_d={grad_norm_d:.2f}"
+                    f"fade={G._fade.item():.2f} rms={l_g_residual.sqrt().item():.4f} "
+                    f"gn_g={grad_norm_g:.3f} gn_d={grad_norm_d:.3f}"
                 )
 
-        # --- Checkpoint ---
         if images_seen - last_ckpt >= ckpt_every:
             wait_for_saves(save_threads)
             save_threads = []
             ckpt_state = build_checkpoint(
                 phase=args.phase, images_seen=images_seen, step=step,
-                G=G, D=D, ema=ema, optG=optG, optD=optD,
-                cfg_dict=cfg, wandb_run_id=wandb_run_id,
+                G=G, D=D, G_ema=G_ema, optG=optG, optD=optD,
+                g_cfg=g_cfg, d_cfg=d_cfg, training_cfg=train_cfg,
+                wandb_run_id=wandb_run_id,
             )
             ckpt_path = run_dir / f"ckpt_{images_seen:09d}.pt"
             grid_path = samples_dir / f"grid_{images_seen:09d}.png"
             save_threads.append(async_save_checkpoint(ckpt_path, ckpt_state))
-            save_sample_grid(G, ema, args.phase, sample_z, grid_path, nrow=4)
+            save_sample_grid(G_ema, sample_z, grid_path, nrow=8)
             if wandb_mode != "disabled":
                 wandb.log({"samples/grid": wandb.Image(str(grid_path))}, step=step)
             print(f"[ckpt] {ckpt_path.name}  [grid] {grid_path.name}")
             last_ckpt = images_seen
 
-    # --- Final save ---
     print("Training complete. Saving final checkpoint...")
     wait_for_saves(save_threads)
     final_state = build_checkpoint(
         phase=args.phase, images_seen=images_seen, step=step,
-        G=G, D=D, ema=ema, optG=optG, optD=optD,
-        cfg_dict=cfg, wandb_run_id=wandb_run_id,
+        G=G, D=D, G_ema=G_ema, optG=optG, optD=optD,
+        g_cfg=g_cfg, d_cfg=d_cfg, training_cfg=train_cfg,
+        wandb_run_id=wandb_run_id,
     )
     save_checkpoint(run_dir / "final.pt", final_state)
     if run is not None:
