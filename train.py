@@ -1,40 +1,29 @@
-"""SR-Refiner GAN training script.
+"""Cascade SR-Refiner GAN training script.
 
-Strategy: frozen backbone + adversarially-trained SR refiner
-------------------------------------------------------------
-The full generator is:
-    G(z) = SRRefiner( BackboneGenerator(z) )
+Two training phases
+-------------------
+Phase 1 — 256 → 512
+  python train.py --phase 1 \\
+    --config configs/phase1_sr512.yaml \\
+    --backbone-ckpt /content/drive/MyDrive/project2/ckpt/ffhq256_baseline.pt
 
-BackboneGenerator is loaded from the 256 baseline checkpoint and frozen.
-Only SRRefiner is optimized. The discriminator sees real 1024 images vs
-G(z) outputs, and provides the adversarial signal that pushes the refiner
-to add realistic high-frequency detail.
+Phase 2 — 512 → 1024
+  python train.py --phase 2 \\
+    --config configs/phase2_sr1024.yaml \\
+    --backbone-ckpt /content/drive/MyDrive/project2/ckpt/ffhq256_baseline.pt \\
+    --sr512-ckpt    /content/drive/MyDrive/project2claude/runs/phase1_sr512/final.pt
 
-Why this is simpler than residual progressive
-----------------------------------------------
-- No fade-in schedule, no residual_rgb_scale to tune
-- No backbone freeze complexity (it's always fully frozen)
-- The refiner is zero-initialized at the output -> starts as bilinear upsample
-- Training dynamics are cleaner: D only needs to distinguish good vs bad 1024
-- Can directly load any 256 baseline checkpoint without partial-match gymnastics
-
-Usage
------
-Train from distributed baseline:
-    python train.py \\
-        --config configs/sr_refiner.yaml \\
-        --backbone-ckpt ckpt/ffhq256_baseline.pt
-
-Resume interrupted run:
-    python train.py \\
-        --config configs/sr_refiner.yaml \\
-        --backbone-ckpt ckpt/ffhq256_baseline.pt \\
-        --resume runs/sr_refiner/ckpt_000050000.pt
+Resume any interrupted run:
+  python train.py --phase 1 \\
+    --config configs/phase1_sr512.yaml \\
+    --backbone-ckpt ... \\
+    --resume /content/drive/MyDrive/project2claude/runs/phase1_sr512/ckpt_000050000.pt
 """
 from __future__ import annotations
 
 import argparse
 import copy
+import os
 import random
 import threading
 import time
@@ -84,7 +73,6 @@ def set_seed(seed: int) -> None:
 
 
 def snapshot_for_save(value):
-    """Recursively clone tensors to CPU before handing off to a save thread."""
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().clone()
     if isinstance(value, dict):
@@ -134,6 +122,7 @@ def wait_for_saves(threads: list[_SaveThread]) -> None:
 
 def build_checkpoint(
     *,
+    phase: int,
     images_seen: int,
     step: int,
     G: Generator,
@@ -141,21 +130,22 @@ def build_checkpoint(
     ema: EMA,
     optG: torch.optim.Optimizer,
     optD: torch.optim.Optimizer,
-    backbone_cfg: BackboneConfig,
-    refiner_cfg: SRRefinerConfig,
-    d_cfg: DiscriminatorConfig,
-    training_cfg: dict,
+    cfg_dict: dict,
     wandb_run_id: str | None,
 ) -> dict:
+    # Save only the refiner being trained (backbone is always reloaded separately)
+    active_refiner_state = (
+        G.sr_512.state_dict() if phase == 1 else G.sr_1024.state_dict()
+    )
     state = {
-        "images_seen": images_seen,
-        "step": step,
-        # Only save the refiner — backbone is always reloaded from its own ckpt
-        "refiner_state":     G.refiner.state_dict(),
-        "refiner_ema_state": ema.state_dict(),
-        "D_state":           D.state_dict(),
-        "optG_state":        optG.state_dict(),
-        "optD_state":        optD.state_dict(),
+        "phase":              phase,
+        "images_seen":        images_seen,
+        "step":               step,
+        "active_refiner_state": active_refiner_state,
+        "ema_state":          ema.state_dict(),
+        "D_state":            D.state_dict(),
+        "optG_state":         optG.state_dict(),
+        "optD_state":         optD.state_dict(),
         "rng_state": {
             "torch":  torch.get_rng_state(),
             "cuda":   torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -163,12 +153,7 @@ def build_checkpoint(
             "python": random.getstate(),
         },
         "wandb_run_id": wandb_run_id,
-        "meta": {
-            "backbone_config": asdict(backbone_cfg),
-            "refiner_config":  asdict(refiner_cfg),
-            "discriminator_config": asdict(d_cfg),
-            "training_config": training_cfg,
-        },
+        "meta":         cfg_dict,
     }
     return snapshot_for_save(state)
 
@@ -177,23 +162,29 @@ def build_checkpoint(
 def save_sample_grid(
     G: Generator,
     ema: EMA,
+    phase: int,
     sample_z: torch.Tensor,
     out_path: Path,
     nrow: int = 4,
 ) -> None:
-    """Generate samples with EMA refiner on top of frozen backbone."""
-    # Temporarily swap in EMA weights for the refiner
-    original_state = copy.deepcopy(G.refiner.state_dict())
-    G.refiner.load_state_dict(ema.state_dict())
-    G.eval()
+    """Swap in EMA weights, generate samples, restore training weights."""
+    active = G.sr_512 if phase == 1 else G.sr_1024
+    original = copy.deepcopy(active.state_dict())
+    active.load_state_dict(ema.state_dict())
 
-    fake = G(sample_z)
+    was_training = G.training
+    G.eval()
+    forward_fn = G.forward_phase1 if phase == 1 else G.forward_phase2
+    fake = forward_fn(sample_z)
     x    = ((fake + 1.0) / 2.0).clamp(0.0, 1.0)
     vutils.save_image(vutils.make_grid(x, nrow=nrow, padding=2), out_path)
 
-    # Restore training weights
-    G.refiner.load_state_dict(original_state)
+    active.load_state_dict(original)
     G.train()
+    G.backbone.eval()
+    if phase == 2:
+        G.sr_512.eval()
+    G.train(was_training)
 
 
 # =============================================================================
@@ -202,15 +193,22 @@ def save_sample_grid(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--phase",         required=True, type=int, choices=[1, 2])
     parser.add_argument("--config",        required=True, type=Path)
     parser.add_argument("--backbone-ckpt", required=True, type=Path,
-                        help="Path to 256 baseline checkpoint (G_ema_state or G_state).")
+                        help="Path to 256 baseline checkpoint.")
+    parser.add_argument("--sr512-ckpt",    type=Path, default=None,
+                        help="[Phase 2 only] checkpoint from Phase 1 (contains sr_512 weights).")
     parser.add_argument("--resume",        type=Path, default=None,
                         help="Resume from a checkpoint saved by this script.")
     parser.add_argument("--total-images",  type=int,  default=None)
     parser.add_argument("--new-wandb-run", action="store_true")
     args = parser.parse_args()
 
+    if args.phase == 2 and args.sr512_ckpt is None and args.resume is None:
+        raise SystemExit("Phase 2 requires --sr512-ckpt (or --resume).")
+
+    # --- Config ---
     cfg       = load_config(args.config)
     train_cfg = cfg["training"]
     if args.total_images is not None:
@@ -221,35 +219,55 @@ def main() -> None:
     torch.backends.cudnn.benchmark = True
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # --- Model ---
-    backbone_cfg = BackboneConfig.from_dict(cfg["backbone"])
-    refiner_cfg  = SRRefinerConfig.from_dict(cfg["refiner"])
-    d_cfg        = DiscriminatorConfig.from_dict(cfg["discriminator"])
+    # --- Build model ---
+    backbone_cfg   = BackboneConfig.from_dict(cfg["backbone"])
+    refiner512_cfg = SRRefinerConfig.from_dict(cfg["refiner_512"])
+    refiner1024_cfg= SRRefinerConfig.from_dict(cfg["refiner_1024"])
+    d_cfg          = DiscriminatorConfig.from_dict(cfg["discriminator"])
 
-    G = Generator(backbone_cfg, refiner_cfg).to(device)
+    G = Generator(backbone_cfg, refiner512_cfg, refiner1024_cfg).to(device)
     D = Discriminator(d_cfg).to(device)
 
-    # Load and freeze backbone
+    # Load & freeze backbone
     G.backbone.load_from_baseline(str(args.backbone_ckpt), device=device)
     G.freeze_backbone()
 
-    n_backbone = sum(p.numel() for p in G.backbone.parameters())
-    n_refiner  = sum(p.numel() for p in G.refiner.parameters())
-    n_g_total  = n_backbone + n_refiner
-    n_d        = sum(p.numel() for p in D.parameters())
-    print(f"BackboneGenerator:  {n_backbone/1e6:.2f}M  (frozen)")
-    print(f"SRRefiner:          {n_refiner/1e6:.2f}M  (trainable)")
-    print(f"Generator total:    {n_g_total/1e6:.2f}M")
-    print(f"Discriminator:      {n_d/1e6:.2f}M")
+    # Phase 2: load sr_512 weights and freeze
+    if args.phase == 2 and args.sr512_ckpt is not None:
+        print(f"Loading SR_512 weights from: {args.sr512_ckpt}")
+        sr_ckpt = torch.load(args.sr512_ckpt, map_location=device, weights_only=False)
+        # Accept both "active_refiner_state" (our format) or "sr_512_state"
+        sr_state = sr_ckpt.get("active_refiner_state", sr_ckpt.get("sr_512_state"))
+        if sr_state is None:
+            raise KeyError("sr512 checkpoint has no 'active_refiner_state' key")
+        G.sr_512.load_state_dict(sr_state)
+        print("  SR_512 loaded OK")
+    if args.phase == 2:
+        G.freeze_sr512()
 
-    if n_g_total > 40e6:
-        raise ValueError(f"Generator {n_g_total/1e6:.2f}M exceeds 40M limit!")
+    # Active refiner & EMA
+    active_refiner = G.sr_512 if args.phase == 1 else G.sr_1024
+    ema = EMA(active_refiner, half_life=train_cfg["ema_half_life"])
 
-    # --- Optimizers (only refiner params for G) ---
-    lr_g = float(train_cfg.get("lr_g", train_cfg.get("lr", 1e-4)))
-    lr_d = float(train_cfg.get("lr_d", train_cfg.get("lr", 1e-4)))
+    # Print param counts
+    n_bb    = sum(p.numel() for p in G.backbone.parameters())
+    n_sr512 = sum(p.numel() for p in G.sr_512.parameters())
+    n_sr1024= sum(p.numel() for p in G.sr_1024.parameters())
+    n_total = n_bb + n_sr512 + n_sr1024
+    n_d     = sum(p.numel() for p in D.parameters())
+    print(f"BackboneGenerator : {n_bb/1e6:.2f}M  (frozen)")
+    print(f"SRRefiner_512     : {n_sr512/1e6:.2f}M  {'(frozen)' if args.phase == 2 else '(trainable)'}")
+    print(f"SRRefiner_1024    : {n_sr1024/1e6:.2f}M  {'(trainable)' if args.phase == 2 else '(unused)'}")
+    print(f"Generator total   : {n_total/1e6:.2f}M")
+    print(f"Discriminator     : {n_d/1e6:.2f}M")
+    if n_total > 40e6:
+        raise ValueError(f"Generator {n_total/1e6:.2f}M exceeds 40M limit!")
+
+    # --- Optimizers ---
+    lr_g = float(train_cfg.get("lr_g", train_cfg.get("lr", 2e-4)))
+    lr_d = float(train_cfg.get("lr_d", train_cfg.get("lr", 2e-4)))
     optG = torch.optim.Adam(
-        G.refiner.parameters(), lr=lr_g,
+        active_refiner.parameters(), lr=lr_g,
         betas=(train_cfg["beta1"], train_cfg["beta2"]), eps=1e-8,
         weight_decay=train_cfg.get("weight_decay", 0.0),
     )
@@ -260,10 +278,8 @@ def main() -> None:
     )
     print(f"Optimizers: lr_g={lr_g}, lr_d={lr_d}")
 
-    ema = EMA(G.refiner, half_life=train_cfg["ema_half_life"])
-
     # --- Dataset ---
-    dataset    = ZipImageDataset(train_cfg["train_zip"], flip=train_cfg.get("flip", True))
+    dataset     = ZipImageDataset(train_cfg["train_zip"], flip=train_cfg.get("flip", True))
     print(f"Dataset: {len(dataset)} images")
     num_workers = train_cfg.get("num_workers", 4)
     loader = DataLoader(
@@ -277,7 +293,6 @@ def main() -> None:
         drop_last=True,
     )
     inf_loader = infinite_loader(loader)
-
     resolution = int(train_cfg["resolution"])
 
     sample_gen = torch.Generator(device="cpu").manual_seed(train_cfg["sample_seed"])
@@ -291,15 +306,15 @@ def main() -> None:
     samples_dir.mkdir(exist_ok=True)
 
     # --- Init / resume ---
-    images_seen   = 0
-    step          = 0
+    images_seen  = 0
+    step         = 0
     wandb_run_id: str | None = None
 
     if args.resume is not None:
         print(f"Resuming from {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        G.refiner.load_state_dict(ckpt["refiner_state"])
-        ema.load_state_dict(ckpt["refiner_ema_state"])
+        active_refiner.load_state_dict(ckpt["active_refiner_state"])
+        ema.load_state_dict(ckpt["ema_state"])
         D.load_state_dict(ckpt["D_state"])
         if "optG_state" in ckpt:
             optG.load_state_dict(ckpt["optG_state"])
@@ -323,7 +338,6 @@ def main() -> None:
             random.setstate(rng["python"])
 
     # --- W&B ---
-    import os
     wandb_cfg  = cfg.get("wandb", {})
     wandb_mode = wandb_cfg.get("mode", "disabled") if _HAS_WANDB else "disabled"
     run        = None
@@ -332,10 +346,9 @@ def main() -> None:
             api_key = os.environ.get(wandb_cfg.get("api_key_env", "WANDB_API_KEY"), "")
             if api_key:
                 wandb.login(key=api_key, relogin=False)
-                print(f"wandb: logged in via env var")
+                print("wandb: logged in via env var")
             else:
-                # Colab에서 키 입력 프롬프트가 뜹니다
-                print("wandb: no API key env var — prompting for login")
+                print("wandb: no API key — prompting for login")
                 wandb.login()
         init_kw: dict = {
             "project": wandb_cfg.get("project", "ffhqgen-student"),
@@ -361,18 +374,14 @@ def main() -> None:
     grad_clip_g    = float(train_cfg.get("grad_clip_g", float("inf")))
     grad_clip_d    = float(train_cfg.get("grad_clip_d", float("inf")))
     augment_policy = train_cfg.get("augment", "") or ""
+    precision      = train_cfg.get("precision", "fp32")
+    use_amp        = (precision == "bf16")
+    amp_dtype      = torch.bfloat16 if use_amp else torch.float32
 
-    precision = train_cfg.get("precision", "fp32")
-    if precision not in ("bf16", "fp32"):
-        raise ValueError(f"precision must be 'bf16' or 'fp32', got {precision!r}")
-    use_amp   = (precision == "bf16")
-    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    forward_fn = G.forward_phase1 if args.phase == 1 else G.forward_phase2
 
-    print(f"Precision: {precision} | Augment: {augment_policy!r}")
-    print(
-        f"Training: images_seen={images_seen} -> {total_images} "
-        f"(batch={train_cfg['batch_size']}, device={device})"
-    )
+    print(f"Phase {args.phase} | resolution={resolution} | augment={augment_policy!r}")
+    print(f"Training: {images_seen} -> {total_images} (batch={train_cfg['batch_size']}, device={device})")
 
     last_ckpt     = images_seen
     save_threads: list[_SaveThread] = []
@@ -381,10 +390,10 @@ def main() -> None:
     last_r1_value: float | None = None
 
     # =========================================================================
-    # Training loop
-    # =========================================================================
     G.train()
-    G.backbone.eval()   # backbone stays eval forever
+    G.backbone.eval()
+    if args.phase == 2:
+        G.sr_512.eval()
 
     while images_seen < total_images:
         real = next(inf_loader).to(device, non_blocking=True)
@@ -399,9 +408,9 @@ def main() -> None:
         # --- D step ---
         z = torch.randn(b, z_dim, device=device)
         with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-            fake   = G.forward_train(z)          # backbone.detach() inside
-            d_real = D(diff_augment(real, augment_policy))
-            d_fake = D(diff_augment(fake.detach(), augment_policy))
+            fake     = forward_fn(z)
+            d_real   = D(diff_augment(real, augment_policy))
+            d_fake   = D(diff_augment(fake.detach(), augment_policy))
             l_d_real = F.softplus(-d_real).mean()
             l_d_fake = F.softplus(d_fake).mean()
             l_d      = l_d_real + l_d_fake
@@ -421,20 +430,20 @@ def main() -> None:
         )
         optD.step()
 
-        # --- G (refiner) step ---
+        # --- G (active refiner) step ---
         z = torch.randn(b, z_dim, device=device)
         with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-            fake_g  = G.forward_train(z)
+            fake_g   = forward_fn(z)
             d_fake_g = D(diff_augment(fake_g, augment_policy))
             l_g      = ns_logistic_g(d_fake_g)
 
         optG.zero_grad(set_to_none=True)
         l_g.backward()
         grad_norm_g = float(
-            torch.nn.utils.clip_grad_norm_(G.refiner.parameters(), max_norm=grad_clip_g)
+            torch.nn.utils.clip_grad_norm_(active_refiner.parameters(), max_norm=grad_clip_g)
         )
         optG.step()
-        ema.update(G.refiner, b)
+        ema.update(active_refiner, b)
 
         images_seen += b
         window_imgs += b
@@ -447,8 +456,8 @@ def main() -> None:
             throughput = window_imgs / elapsed
             window_t0  = now
             window_imgs = 0
-
             log = {
+                "phase":                   args.phase,
                 "images_seen":             images_seen,
                 "throughput/imgs_per_sec": throughput,
                 "loss/D_total":            float(l_d.item()),
@@ -468,7 +477,8 @@ def main() -> None:
                 wandb.log(log, step=step)
             else:
                 print(
-                    f"step={step} imgs={images_seen} thr={throughput:.0f}img/s "
+                    f"[P{args.phase}] step={step} imgs={images_seen} "
+                    f"thr={throughput:.0f}img/s "
                     f"l_d={l_d.item():.3f} l_g={l_g.item():.3f} "
                     f"gn_g={grad_norm_g:.2f} gn_d={grad_norm_d:.2f}"
                 )
@@ -477,20 +487,15 @@ def main() -> None:
         if images_seen - last_ckpt >= ckpt_every:
             wait_for_saves(save_threads)
             save_threads = []
-
             ckpt_state = build_checkpoint(
-                images_seen=images_seen, step=step,
+                phase=args.phase, images_seen=images_seen, step=step,
                 G=G, D=D, ema=ema, optG=optG, optD=optD,
-                backbone_cfg=backbone_cfg, refiner_cfg=refiner_cfg,
-                d_cfg=d_cfg, training_cfg=train_cfg,
-                wandb_run_id=wandb_run_id,
+                cfg_dict=cfg, wandb_run_id=wandb_run_id,
             )
             ckpt_path = run_dir / f"ckpt_{images_seen:09d}.pt"
             grid_path = samples_dir / f"grid_{images_seen:09d}.png"
-
             save_threads.append(async_save_checkpoint(ckpt_path, ckpt_state))
-            save_sample_grid(G, ema, sample_z, grid_path, nrow=4)
-
+            save_sample_grid(G, ema, args.phase, sample_z, grid_path, nrow=4)
             if wandb_mode != "disabled":
                 wandb.log({"samples/grid": wandb.Image(str(grid_path))}, step=step)
             print(f"[ckpt] {ckpt_path.name}  [grid] {grid_path.name}")
@@ -500,11 +505,9 @@ def main() -> None:
     print("Training complete. Saving final checkpoint...")
     wait_for_saves(save_threads)
     final_state = build_checkpoint(
-        images_seen=images_seen, step=step,
+        phase=args.phase, images_seen=images_seen, step=step,
         G=G, D=D, ema=ema, optG=optG, optD=optD,
-        backbone_cfg=backbone_cfg, refiner_cfg=refiner_cfg,
-        d_cfg=d_cfg, training_cfg=train_cfg,
-        wandb_run_id=wandb_run_id,
+        cfg_dict=cfg, wandb_run_id=wandb_run_id,
     )
     save_checkpoint(run_dir / "final.pt", final_state)
     if run is not None:
