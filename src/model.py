@@ -540,7 +540,7 @@ GENERATOR_512_CONFIG = GeneratorConfig(
 
 DISCRIMINATOR_512_CONFIG = DiscriminatorConfig(
     resolutions=[512, 256, 128, 64, 32, 16, 8, 4],
-    channels={512: 64, 256: 64, 128: 128, 64: 256, 32: 512, 16: 512, 8: 512, 4: 512},
+    channels={512: 32, 256: 64, 128: 128, 64: 256, 32: 256, 16: 256, 8: 256, 4: 256},
     use_spectral_norm=True, minibatch_std_group=4, attention_resolutions=[32],
 )
 

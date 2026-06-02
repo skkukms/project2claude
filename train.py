@@ -40,6 +40,8 @@ except ImportError:
     wandb = None
     _HAS_WANDB = False
 
+import torch.nn as nn
+
 from src.augment import diff_augment
 from src.dataset import ZipImageDataset, infinite_loader
 from src.losses import ns_logistic_g, r1_penalty
@@ -176,7 +178,6 @@ def init_from_checkpoint(
         module.load_state_dict(target)
         print(f"  {label}: {len(matched)}/{len(source)} tensors matched")
 
-    import torch.nn as nn
     print(f"Loading weights from: {init_path}")
     ckpt = torch.load(init_path, map_location=device, weights_only=False)
 
@@ -314,13 +315,18 @@ def main() -> None:
 
     # Apply freeze based on phase
     freeze_cfg = train_cfg.get("freeze_resolutions", [])
+    needs_freeze = bool(freeze_cfg) or train_cfg.get("freeze_backbone", False)
+
     if freeze_cfg:
         G.freeze_up_to([int(r) for r in freeze_cfg])
     elif train_cfg.get("freeze_backbone", False):
         G.freeze_backbone()
 
-    # Rebuild optimizer with only trainable params
-    if any(train_cfg.get(k) for k in ("freeze_backbone", "freeze_resolutions")):
+    # Rebuild optimizer with only trainable params.
+    # Must happen AFTER resume so we don't clobber loaded optimizer state
+    # for the wrong param group. For --resume, optimizer state was already
+    # loaded above and param groups match the frozen layout.
+    if needs_freeze and not args.resume:
         optG = torch.optim.Adam(
             filter(lambda p: p.requires_grad, G.parameters()),
             lr=lr_g, betas=(beta1, beta2), eps=1e-8, weight_decay=wd,
